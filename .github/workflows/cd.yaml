@@ -78,19 +78,26 @@ jobs:
       - name: Install genifest
         env:
           GH_TOKEN: ${{ github.token }}
+          INPUT_VERSION: ${{ inputs.genifest-version }}
         run: |
           set -euo pipefail
           echo "Installing genifest..."
           
           # Determine version to install
-          if [ "${{ inputs.genifest-version }}" = "latest" ]; then
+          if [ "$INPUT_VERSION" = "latest" ]; then
             VERSION=$(gh api repos/zostay/genifest/releases/latest --jq '.tag_name' | sed 's/^v//')
             if [ -z "$VERSION" ]; then
               echo "Error: Failed to fetch latest version"
               exit 1
             fi
           else
-            VERSION="${{ inputs.genifest-version }}"
+            # Validate version format (semantic versioning with optional prerelease)
+            if ! echo "$INPUT_VERSION" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+(-[a-zA-Z0-9]+)?$'; then
+              echo "Error: Invalid version format: $INPUT_VERSION"
+              echo "Expected format: X.Y.Z or X.Y.Z-prerelease (e.g., 1.0.0 or 1.0.0-rc6)"
+              exit 1
+            fi
+            VERSION="$INPUT_VERSION"
           fi
           
           echo "Installing genifest version: $VERSION"
@@ -106,6 +113,10 @@ jobs:
           
           echo "Platform: $OS_NAME-$OS_ARCH"
           
+          # Create local bin directory and add to PATH
+          mkdir -p "$HOME/.local/bin"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          
           # Download binary using GitHub CLI with built-in verification
           ASSET_NAME="genifest-$VERSION-$OS_NAME-$OS_ARCH"
           echo "Downloading asset: $ASSET_NAME"
@@ -113,12 +124,12 @@ jobs:
           gh release download "v$VERSION" \
             --repo zostay/genifest \
             --pattern "$ASSET_NAME" \
-            --output /usr/local/bin/genifest
+            --output "$HOME/.local/bin/genifest"
           
-          chmod +x /usr/local/bin/genifest
+          chmod +x "$HOME/.local/bin/genifest"
           
           # Verify installation
-          genifest version
+          "$HOME/.local/bin/genifest" version
 
       - name: Validate Configuration
         working-directory: ${{ inputs.working-directory }}
