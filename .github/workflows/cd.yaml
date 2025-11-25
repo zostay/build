@@ -90,9 +90,14 @@ jobs:
               echo "Error: Failed to fetch latest version"
               exit 1
             fi
+            # Validate the fetched version follows semantic versioning
+            if ! echo "$VERSION" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+(-[a-zA-Z0-9.-]+)?$'; then
+              echo "Error: Fetched version does not match expected format: $VERSION"
+              exit 1
+            fi
           else
             # Validate version format (semantic versioning with optional prerelease)
-            if ! echo "$INPUT_VERSION" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+(-[a-zA-Z0-9]+)?$'; then
+            if ! echo "$INPUT_VERSION" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+(-[a-zA-Z0-9.-]+)?$'; then
               echo "Error: Invalid version format: $INPUT_VERSION"
               echo "Expected format: X.Y.Z or X.Y.Z-prerelease (e.g., 1.0.0 or 1.0.0-rc6)"
               exit 1
@@ -179,12 +184,16 @@ jobs:
       - name: Commit Changes
         id: commit
         if: inputs.commit-changes && steps.check-changes.outputs.changes-made == 'true'
+        env:
+          GIT_USER_NAME: ${{ inputs.git-user-name }}
+          GIT_USER_EMAIL: ${{ inputs.git-user-email }}
+          COMMIT_MESSAGE: ${{ inputs.commit-message }}
         run: |
-          git config user.name "${{ inputs.git-user-name }}"
-          git config user.email "${{ inputs.git-user-email }}"
+          git config user.name "$GIT_USER_NAME"
+          git config user.email "$GIT_USER_EMAIL"
           
           git add -A
-          git commit -m "${{ inputs.commit-message }}"
+          git commit -m "$COMMIT_MESSAGE"
           
           COMMIT_SHA=$(git rev-parse HEAD)
           echo "commit-sha=$COMMIT_SHA" >> $GITHUB_OUTPUT
