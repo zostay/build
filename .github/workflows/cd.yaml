@@ -114,6 +114,8 @@ jobs:
           # Map architecture names
           if [ "$OS_ARCH" = "x86_64" ]; then
             OS_ARCH="amd64"
+          elif [ "$OS_ARCH" = "aarch64" ]; then
+            OS_ARCH="arm64"
           fi
           
           echo "Platform: $OS_NAME-$OS_ARCH"
