@@ -1,0 +1,161 @@
+name: Continuous Deployment
+
+on:
+  workflow_call:
+    inputs:
+      genifest-version:
+        description: 'Version of genifest to install (e.g., "latest" or "1.0.0-rc6")'
+        required: false
+        type: string
+        default: 'latest'
+      genifest-group:
+        description: 'Genifest group to run (e.g., "all", "config-only", "prod")'
+        required: false
+        type: string
+        default: 'all'
+      genifest-tag:
+        description: 'Additional tag expression to apply (e.g., "!secret-*")'
+        required: false
+        type: string
+        default: ''
+      working-directory:
+        description: 'Working directory containing genifest.yaml configuration'
+        required: false
+        type: string
+        default: '.'
+      output-mode:
+        description: 'Output mode for genifest (auto, color, plain, markdown)'
+        required: false
+        type: string
+        default: 'plain'
+      commit-changes:
+        description: 'Whether to commit the manifest changes'
+        required: false
+        type: boolean
+        default: true
+      commit-message:
+        description: 'Commit message for manifest changes'
+        required: false
+        type: string
+        default: 'chore: update kubernetes manifests via genifest'
+      push-changes:
+        description: 'Whether to push committed changes (requires commit-changes: true)'
+        required: false
+        type: boolean
+        default: true
+      git-user-name:
+        description: 'Git user name for commits'
+        required: false
+        type: string
+        default: 'github-actions[bot]'
+      git-user-email:
+        description: 'Git user email for commits'
+        required: false
+        type: string
+        default: 'github-actions[bot]@users.noreply.github.com'
+    outputs:
+      changes-made:
+        description: 'Whether any manifest changes were made'
+        value: ${{ jobs.deploy.outputs.changes-made }}
+      commit-sha:
+        description: 'SHA of the commit with manifest changes (if committed)'
+        value: ${{ jobs.deploy.outputs.commit-sha }}
+
+jobs:
+  deploy:
+    name: Update Manifests
+    runs-on: ubuntu-latest
+    outputs:
+      changes-made: ${{ steps.check-changes.outputs.changes-made }}
+      commit-sha: ${{ steps.commit.outputs.commit-sha }}
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+          token: ${{ github.token }}
+
+      - name: Install genifest
+        run: |
+          echo "Installing genifest..."
+          
+          # Determine version to install
+          if [ "${{ inputs.genifest-version }}" = "latest" ]; then
+            VERSION=$(curl -s https://api.github.com/repos/zostay/genifest/releases/latest | grep tag_name | cut -d '"' -f 4 | cut -c 2-)
+          else
+            VERSION="${{ inputs.genifest-version }}"
+          fi
+          
+          echo "Installing genifest version: $VERSION"
+          
+          # Detect platform
+          OS_NAME=$(uname -s | tr '[:upper:]' '[:lower:]')
+          OS_ARCH=$(uname -m)
+          
+          # Map architecture names
+          if [ "$OS_ARCH" = "x86_64" ]; then
+            OS_ARCH="amd64"
+          fi
+          
+          echo "Platform: $OS_NAME-$OS_ARCH"
+          
+          # Download and install
+          DOWNLOAD_URL="https://github.com/zostay/genifest/releases/download/v$VERSION/genifest-$VERSION-$OS_NAME-$OS_ARCH"
+          echo "Downloading from: $DOWNLOAD_URL"
+          
+          curl -L "$DOWNLOAD_URL" -o /usr/local/bin/genifest
+          chmod +x /usr/local/bin/genifest
+          
+          # Verify installation
+          genifest version
+
+      - name: Validate Configuration
+        working-directory: ${{ inputs.working-directory }}
+        run: |
+          echo "Validating genifest configuration..."
+          genifest validate --output=${{ inputs.output-mode }}
+
+      - name: Run genifest
+        working-directory: ${{ inputs.working-directory }}
+        run: |
+          echo "Running genifest..."
+          
+          ARGS="${{ inputs.genifest-group }}"
+          
+          if [ -n "${{ inputs.genifest-tag }}" ]; then
+            ARGS="--tag \"${{ inputs.genifest-tag }}\" $ARGS"
+          fi
+          
+          echo "Running: genifest run --output=${{ inputs.output-mode }} $ARGS"
+          eval genifest run --output=${{ inputs.output-mode }} $ARGS
+
+      - name: Check for Changes
+        id: check-changes
+        run: |
+          if git diff --quiet; then
+            echo "No manifest changes detected"
+            echo "changes-made=false" >> $GITHUB_OUTPUT
+          else
+            echo "Manifest changes detected:"
+            git diff --stat
+            echo "changes-made=true" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Commit Changes
+        id: commit
+        if: inputs.commit-changes && steps.check-changes.outputs.changes-made == 'true'
+        run: |
+          git config user.name "${{ inputs.git-user-name }}"
+          git config user.email "${{ inputs.git-user-email }}"
+          
+          git add -A
+          git commit -m "${{ inputs.commit-message }}"
+          
+          COMMIT_SHA=$(git rev-parse HEAD)
+          echo "commit-sha=$COMMIT_SHA" >> $GITHUB_OUTPUT
+          echo "Committed changes with SHA: $COMMIT_SHA"
+
+      - name: Push Changes
+        if: inputs.commit-changes && inputs.push-changes && steps.check-changes.outputs.changes-made == 'true'
+        run: |
+          git push
