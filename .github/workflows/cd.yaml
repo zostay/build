@@ -76,12 +76,19 @@ jobs:
           token: ${{ github.token }}
 
       - name: Install genifest
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
+          set -euo pipefail
           echo "Installing genifest..."
           
           # Determine version to install
           if [ "${{ inputs.genifest-version }}" = "latest" ]; then
-            VERSION=$(curl -s https://api.github.com/repos/zostay/genifest/releases/latest | grep tag_name | cut -d '"' -f 4 | cut -c 2-)
+            VERSION=$(gh api repos/zostay/genifest/releases/latest --jq '.tag_name' | sed 's/^v//')
+            if [ -z "$VERSION" ]; then
+              echo "Error: Failed to fetch latest version"
+              exit 1
+            fi
           else
             VERSION="${{ inputs.genifest-version }}"
           fi
@@ -99,11 +106,15 @@ jobs:
           
           echo "Platform: $OS_NAME-$OS_ARCH"
           
-          # Download and install
-          DOWNLOAD_URL="https://github.com/zostay/genifest/releases/download/v$VERSION/genifest-$VERSION-$OS_NAME-$OS_ARCH"
-          echo "Downloading from: $DOWNLOAD_URL"
+          # Download binary using GitHub CLI with built-in verification
+          ASSET_NAME="genifest-$VERSION-$OS_NAME-$OS_ARCH"
+          echo "Downloading asset: $ASSET_NAME"
           
-          curl -L "$DOWNLOAD_URL" -o /usr/local/bin/genifest
+          gh release download "v$VERSION" \
+            --repo zostay/genifest \
+            --pattern "$ASSET_NAME" \
+            --output /usr/local/bin/genifest
+          
           chmod +x /usr/local/bin/genifest
           
           # Verify installation
@@ -111,23 +122,36 @@ jobs:
 
       - name: Validate Configuration
         working-directory: ${{ inputs.working-directory }}
+        env:
+          OUTPUT_MODE: ${{ inputs.output-mode }}
         run: |
+          set -euo pipefail
           echo "Validating genifest configuration..."
-          genifest validate --output=${{ inputs.output-mode }}
+          genifest validate --output="$OUTPUT_MODE"
 
       - name: Run genifest
         working-directory: ${{ inputs.working-directory }}
+        env:
+          GENIFEST_GROUP: ${{ inputs.genifest-group }}
+          GENIFEST_TAG: ${{ inputs.genifest-tag }}
+          OUTPUT_MODE: ${{ inputs.output-mode }}
         run: |
+          set -euo pipefail
           echo "Running genifest..."
           
-          ARGS="${{ inputs.genifest-group }}"
+          # Build command arguments safely using arrays
+          ARGS=("run" "--output=$OUTPUT_MODE")
           
-          if [ -n "${{ inputs.genifest-tag }}" ]; then
-            ARGS="--tag \"${{ inputs.genifest-tag }}\" $ARGS"
+          # Add tag if specified (placed before group as per genifest CLI)
+          if [ -n "$GENIFEST_TAG" ]; then
+            ARGS+=("--tag" "$GENIFEST_TAG")
           fi
           
-          echo "Running: genifest run --output=${{ inputs.output-mode }} $ARGS"
-          eval genifest run --output=${{ inputs.output-mode }} $ARGS
+          # Add group argument
+          ARGS+=("$GENIFEST_GROUP")
+          
+          echo "Running: genifest ${ARGS[*]}"
+          genifest "${ARGS[@]}"
 
       - name: Check for Changes
         id: check-changes
