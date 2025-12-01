@@ -27,7 +27,7 @@ on:
         description: 'Output mode for genifest (auto, color, plain, markdown)'
         required: false
         type: string
-        default: 'plain'
+        default: 'markdown'
       commit-changes:
         description: 'Whether to commit the manifest changes'
         required: false
@@ -43,6 +43,16 @@ on:
         required: false
         type: boolean
         default: true
+      create-pr:
+        description: 'Whether to create a pull request for the changes'
+        required: false
+        type: boolean
+        default: false
+      pr-target-branch:
+        description: 'Target branch for the pull request (defaults to deploy-{source-branch})'
+        required: false
+        type: string
+        default: ''
       git-user-name:
         description: 'Git user name for commits'
         required: false
@@ -60,20 +70,84 @@ on:
       commit-sha:
         description: 'SHA of the commit with manifest changes (if committed)'
         value: ${{ jobs.deploy.outputs.commit-sha }}
+      pr-number:
+        description: 'Pull request number (if created)'
+        value: ${{ jobs.deploy.outputs.pr-number }}
+      pr-url:
+        description: 'Pull request URL (if created)'
+        value: ${{ jobs.deploy.outputs.pr-url }}
 
 jobs:
   deploy:
     name: Update Manifests
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
     outputs:
       changes-made: ${{ steps.check-changes.outputs.changes-made }}
       commit-sha: ${{ steps.commit.outputs.commit-sha }}
+      pr-number: ${{ steps.create-pr.outputs.pr-number }}
+      pr-url: ${{ steps.create-pr.outputs.pr-url }}
     steps:
       - name: Checkout Repository
         uses: actions/checkout@v5
         with:
           fetch-depth: 0
           token: ${{ github.token }}
+
+      - name: Setup Git User
+        env:
+          GIT_USER_NAME: ${{ inputs.git-user-name }}
+          GIT_USER_EMAIL: ${{ inputs.git-user-email }}
+        run: |
+          git config user.name "$GIT_USER_NAME"
+          git config user.email "$GIT_USER_EMAIL"
+
+      - name: Create Deployment Branch
+        id: branch-setup
+        if: inputs.create-pr
+        env:
+          TARGET_BRANCH: ${{ inputs.pr-target-branch }}
+        run: |
+          set -euo pipefail
+
+          # Set up branch names
+          if [ -z "$TARGET_BRANCH" ]; then
+            DEPLOY_TARGET="deploy-${{ github.ref_name }}"
+          else
+            DEPLOY_TARGET="$TARGET_BRANCH"
+          fi
+
+          BUILD_TAG="${{ github.ref_name }}-${{ github.run_number }}.${{ github.run_attempt }}"
+          BRANCH_NAME="deploy-$BUILD_TAG-$(date +%Y%m%d-%H%M%S)"
+
+          echo "DEPLOY_TARGET=$DEPLOY_TARGET" >> $GITHUB_ENV
+          echo "BRANCH_NAME=$BRANCH_NAME" >> $GITHUB_ENV
+          echo "BUILD_TAG=$BUILD_TAG" >> $GITHUB_ENV
+
+          echo "deploy-target=$DEPLOY_TARGET" >> $GITHUB_OUTPUT
+          echo "branch-name=$BRANCH_NAME" >> $GITHUB_OUTPUT
+          echo "build-tag=$BUILD_TAG" >> $GITHUB_OUTPUT
+
+          # Check if the deploy-* branch exists
+          if git ls-remote --exit-code --heads origin "$DEPLOY_TARGET" > /dev/null 2>&1; then
+            echo "Deploy branch $DEPLOY_TARGET exists, updating it with latest changes from ${{ github.ref_name }}"
+            # Fetch the existing deploy branch
+            git fetch origin "$DEPLOY_TARGET:$DEPLOY_TARGET"
+            # Create new deployment branch from current HEAD (which has latest changes)
+            git checkout -b "$BRANCH_NAME"
+            # Merge any deployment-specific changes from the existing deploy branch
+            # This allows for deployment-only files that aren't in the source branch
+            git merge "$DEPLOY_TARGET" --no-edit || {
+              echo "Merge conflict detected. Deploy branch may need manual resolution."
+              git merge --abort
+              echo "Proceeding with deployment branch from current HEAD only"
+            }
+          else
+            echo "Deploy branch $DEPLOY_TARGET does not exist, branching from current HEAD"
+            git checkout -b "$BRANCH_NAME"
+          fi
 
       - name: Install genifest
         env:
@@ -82,7 +156,7 @@ jobs:
         run: |
           set -euo pipefail
           echo "Installing genifest..."
-          
+
           # Determine version to install
           if [ "$INPUT_VERSION" = "latest" ]; then
             VERSION=$(gh api repos/zostay/genifest/releases/latest --jq '.tag_name' | sed 's/^v//')
@@ -104,37 +178,37 @@ jobs:
             fi
             VERSION="$INPUT_VERSION"
           fi
-          
+
           echo "Installing genifest version: $VERSION"
-          
+
           # Detect platform
           OS_NAME=$(uname -s | tr '[:upper:]' '[:lower:]')
           OS_ARCH=$(uname -m)
-          
+
           # Map architecture names
           if [ "$OS_ARCH" = "x86_64" ]; then
             OS_ARCH="amd64"
           elif [ "$OS_ARCH" = "aarch64" ]; then
             OS_ARCH="arm64"
           fi
-          
+
           echo "Platform: $OS_NAME-$OS_ARCH"
-          
+
           # Create local bin directory and add to PATH
           mkdir -p "$HOME/.local/bin"
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
-          
+
           # Download binary using GitHub CLI with built-in verification
           ASSET_NAME="genifest-$VERSION-$OS_NAME-$OS_ARCH"
           echo "Downloading asset: $ASSET_NAME"
-          
+
           gh release download "v$VERSION" \
             --repo zostay/genifest \
             --pattern "$ASSET_NAME" \
             --output "$HOME/.local/bin/genifest"
-          
+
           chmod +x "$HOME/.local/bin/genifest"
-          
+
           # Verify installation
           "$HOME/.local/bin/genifest" version
 
@@ -147,29 +221,73 @@ jobs:
           echo "Validating genifest configuration..."
           genifest validate --output="$OUTPUT_MODE"
 
-      - name: Run genifest
+      - name: Run genifest with Markdown Logging
         working-directory: ${{ inputs.working-directory }}
         env:
           GENIFEST_GROUP: ${{ inputs.genifest-group }}
           GENIFEST_TAG: ${{ inputs.genifest-tag }}
           OUTPUT_MODE: ${{ inputs.output-mode }}
+          BUILD_TAG: ${{ env.BUILD_TAG }}
         run: |
           set -euo pipefail
-          echo "Running genifest..."
-          
-          # Build command arguments safely using arrays
-          ARGS=("run" "--output=$OUTPUT_MODE")
-          
-          # Add tag if specified (placed before group as per genifest CLI)
-          if [ -n "$GENIFEST_TAG" ]; then
-            ARGS+=("--tag" "$GENIFEST_TAG")
-          fi
-          
-          # Add group argument
-          ARGS+=("$GENIFEST_GROUP")
-          
-          echo "Running: genifest ${ARGS[*]}"
-          genifest "${ARGS[@]}"
+
+          # Create genifest log with detailed information
+          {
+            echo "# Genifest Deployment Report"
+            echo
+            echo "**Branch:** ${{ github.ref_name }}"
+            echo "**Build Tag:** ${BUILD_TAG:-${{ github.ref_name }}-${{ github.run_number }}.${{ github.run_attempt }}}"
+            echo "**Genifest Group:** $GENIFEST_GROUP"
+            echo "**Timestamp:** $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
+            echo
+            echo "## Environment Variables"
+            echo
+            echo "<details><summary>Click to expand</summary>"
+            echo
+            echo '```bash'
+            env | sort
+            echo '```'
+            echo
+            echo "</details>"
+            echo
+            echo "## Genifest Version"
+            echo
+            echo '```'
+            genifest version
+            echo '```'
+            echo
+            echo "## Genifest Configuration"
+            echo
+            echo '```yaml'
+            genifest config
+            echo '```'
+            echo
+            echo "## Genifest Output"
+            echo
+
+            # Build command arguments safely using arrays
+            ARGS=("run" "--output=$OUTPUT_MODE")
+
+            # Add tag if specified (placed before group as per genifest CLI)
+            if [ -n "$GENIFEST_TAG" ]; then
+              ARGS+=("--tag" "$GENIFEST_TAG")
+            fi
+
+            # Add group argument
+            ARGS+=("$GENIFEST_GROUP")
+
+            echo "Running: genifest ${ARGS[*]}"
+            echo
+            genifest "${ARGS[@]}"
+          } > genifest.log 2>&1 || {
+            echo "Genifest failed with exit code $?"
+            echo "Genifest log output:"
+            cat genifest.log
+            exit 1
+          }
+
+          # Display the log for workflow visibility
+          cat genifest.log
 
       - name: Check for Changes
         id: check-changes
@@ -187,21 +305,61 @@ jobs:
         id: commit
         if: inputs.commit-changes && steps.check-changes.outputs.changes-made == 'true'
         env:
-          GIT_USER_NAME: ${{ inputs.git-user-name }}
-          GIT_USER_EMAIL: ${{ inputs.git-user-email }}
           COMMIT_MESSAGE: ${{ inputs.commit-message }}
+          BUILD_TAG: ${{ env.BUILD_TAG }}
         run: |
-          git config user.name "$GIT_USER_NAME"
-          git config user.email "$GIT_USER_EMAIL"
-          
           git add -A
-          git commit -m "$COMMIT_MESSAGE"
-          
+
+          # Use BUILD_TAG in commit message if available, otherwise use the default message
+          if [ -n "${BUILD_TAG:-}" ]; then
+            FINAL_MESSAGE="Deploy ${BUILD_TAG} - ${COMMIT_MESSAGE}"
+          else
+            FINAL_MESSAGE="$COMMIT_MESSAGE"
+          fi
+
+          git commit -m "$FINAL_MESSAGE"
+
           COMMIT_SHA=$(git rev-parse HEAD)
           echo "commit-sha=$COMMIT_SHA" >> $GITHUB_OUTPUT
           echo "Committed changes with SHA: $COMMIT_SHA"
 
       - name: Push Changes
         if: inputs.commit-changes && inputs.push-changes && steps.check-changes.outputs.changes-made == 'true'
+        env:
+          BRANCH_NAME: ${{ env.BRANCH_NAME }}
         run: |
-          git push
+          if [ -n "${BRANCH_NAME:-}" ]; then
+            # Push to the deployment branch if we created one
+            git push origin "$BRANCH_NAME"
+          else
+            # Push to current branch for non-PR workflows
+            git push
+          fi
+
+      - name: Create Pull Request
+        id: create-pr
+        if: inputs.create-pr && steps.check-changes.outputs.changes-made == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          DEPLOY_TARGET: ${{ env.DEPLOY_TARGET }}
+          BRANCH_NAME: ${{ env.BRANCH_NAME }}
+          BUILD_TAG: ${{ env.BUILD_TAG }}
+        run: |
+          set -euo pipefail
+
+          PR_TITLE="Deploy ${BUILD_TAG} $(date +%Y%m%d-%H%M%S)"
+
+          # Create PR with genifest log as the body
+          PR_URL=$(gh pr create \
+            --base "$DEPLOY_TARGET" \
+            --head "$BRANCH_NAME" \
+            --title "$PR_TITLE" \
+            --body-file genifest.log)
+
+          # Extract PR number from URL
+          PR_NUMBER=$(echo "$PR_URL" | sed 's/.*\/pull\/\([0-9]*\)/\1/')
+
+          echo "pr-number=$PR_NUMBER" >> $GITHUB_OUTPUT
+          echo "pr-url=$PR_URL" >> $GITHUB_OUTPUT
+
+          echo "Created pull request: $PR_URL"
