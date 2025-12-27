@@ -63,6 +63,11 @@ on:
         required: false
         type: string
         default: 'github-actions[bot]@users.noreply.github.com'
+      environment-variables:
+        description: 'Environment variables to set for genifest execution (JSON format, e.g. {"VAR1":"value1","VAR2":"value2"})'
+        required: false
+        type: string
+        default: '{}'
     outputs:
       changes-made:
         description: 'Whether any manifest changes were made'
@@ -212,6 +217,58 @@ jobs:
           # Verify installation
           "$HOME/.local/bin/genifest" version
 
+      - name: Set Custom Environment Variables
+        id: set-env-vars
+        env:
+          ENV_VARS_JSON: ${{ inputs.environment-variables }}
+        run: |
+          set -euo pipefail
+          echo "Setting custom environment variables..."
+
+          # Validate JSON format
+          if ! echo "$ENV_VARS_JSON" | jq empty 2>/dev/null; then
+            echo "Error: environment-variables input is not valid JSON format"
+            echo "Expected format: {\"VAR1\":\"value1\",\"VAR2\":\"value2\"}"
+            echo "Received: $ENV_VARS_JSON"
+            exit 1
+          fi
+
+          # Check if we have any variables to set
+          if [ "$ENV_VARS_JSON" = "{}" ]; then
+            echo "No custom environment variables provided"
+            echo "custom-vars-count=0" >> $GITHUB_OUTPUT
+          else
+            # Parse JSON and set environment variables
+            echo "Parsing and setting environment variables..."
+            VARS_COUNT=0
+
+            # Create a temporary file to store environment exports
+            ENV_FILE=$(mktemp)
+
+            # Extract key-value pairs and export them
+            echo "$ENV_VARS_JSON" | jq -r 'to_entries[] | "\(.key)=\(.value)"' | while IFS='=' read -r key value; do
+              # Validate variable name (must be valid shell variable name)
+              if ! echo "$key" | grep -qE '^[A-Za-z_][A-Za-z0-9_]*$'; then
+                echo "Error: Invalid environment variable name: $key"
+                echo "Variable names must start with a letter or underscore and contain only letters, numbers, and underscores"
+                exit 1
+              fi
+
+              # Export the variable for subsequent steps
+              echo "$key=$value" >> $GITHUB_ENV
+              echo "export $key=\"$value\"" >> "$ENV_FILE"
+              echo "Set: $key"
+              VARS_COUNT=$((VARS_COUNT + 1))
+            done
+
+            # Store the count for reporting
+            VARS_COUNT=$(echo "$ENV_VARS_JSON" | jq '. | length')
+            echo "custom-vars-count=$VARS_COUNT" >> $GITHUB_OUTPUT
+            echo "Successfully set $VARS_COUNT custom environment variables"
+
+            rm -f "$ENV_FILE"
+          fi
+
       - name: Validate Configuration
         working-directory: ${{ inputs.working-directory }}
         env:
@@ -242,7 +299,16 @@ jobs:
             echo
             echo "## Environment Variables"
             echo
-            echo "<details><summary>Click to expand</summary>"
+            if [ "${{ steps.set-env-vars.outputs.custom-vars-count }}" -gt 0 ]; then
+              echo "**Custom variables set:** ${{ steps.set-env-vars.outputs.custom-vars-count }}"
+              echo
+              echo "**Custom Environment Variables:**"
+              echo '```bash'
+              echo "${{ inputs.environment-variables }}" | jq -r 'to_entries[] | "\(.key)=\(.value)"' | sort
+              echo '```'
+              echo
+            fi
+            echo "<details><summary>All Environment Variables</summary>"
             echo
             echo '```bash'
             env | sort

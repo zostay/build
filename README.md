@@ -85,6 +85,7 @@ jobs:
       pr-target-branch: 'deploy-main'     # target branch for PR
       git-user-name: 'github-actions[bot]'
       git-user-email: 'github-actions[bot]@users.noreply.github.com'
+      environment-variables: '{"REGISTRY_URL":"ghcr.io","APP_VERSION":"v1.2.3","DEBUG":"true"}'
 ```
 
 #### Inputs
@@ -103,6 +104,7 @@ jobs:
 | `pr-target-branch` | Target branch for PR (defaults to deploy-{source-branch}) | No | `''` |
 | `git-user-name` | Git user name for commits | No | `github-actions[bot]` |
 | `git-user-email` | Git user email for commits | No | `github-actions[bot]@users.noreply.github.com` |
+| `environment-variables` | Environment variables to set for genifest execution (JSON format) | No | `'{}'` |
 
 #### Outputs
 
@@ -157,6 +159,62 @@ When `create-pr: true` is enabled, the workflow implements a state-of-the-art de
 - Enables team review and approval before deployment
 
 This approach ensures that all deployment changes go through proper review processes while maintaining full automation and detailed audit trails.
+
+## Environment Variables
+
+The workflow supports setting custom environment variables that will be available during genifest execution. This is useful for passing configuration values, API tokens, or other dynamic values that genifest might need.
+
+### Usage
+
+Environment variables are passed as a JSON string using the `environment-variables` input:
+
+```yaml
+jobs:
+  deploy:
+    uses: zostay/build/.github/workflows/cd.yaml@main
+    with:
+      genifest-group: 'prod'
+      environment-variables: '{"API_TOKEN":"${{ secrets.API_TOKEN }}","REGISTRY_URL":"ghcr.io","APP_VERSION":"v1.2.3"}'
+```
+
+### Features
+
+- **JSON Format**: Variables are specified as a JSON object with string keys and values
+- **Validation**: Variable names are validated to ensure they're valid shell identifiers
+- **Logging**: Custom variables are logged separately in the deployment report for visibility
+- **Security**: Sensitive values should use GitHub secrets and will be masked in logs
+- **Flexible**: Supports any number of environment variables
+
+### Examples
+
+#### Basic Environment Variables
+```yaml
+environment-variables: '{"DEBUG":"true","LOG_LEVEL":"info"}'
+```
+
+#### Using GitHub Secrets
+```yaml
+environment-variables: '{"API_TOKEN":"${{ secrets.API_TOKEN }}","DB_PASSWORD":"${{ secrets.DB_PASSWORD }}"}'
+```
+
+#### Complex Configuration
+```yaml
+environment-variables: |
+  {
+    "REGISTRY_URL": "ghcr.io",
+    "APP_VERSION": "${{ github.ref_name }}",
+    "BUILD_NUMBER": "${{ github.run_number }}",
+    "ENVIRONMENT": "production",
+    "DEBUG": "false"
+  }
+```
+
+### Variable Name Requirements
+
+- Must start with a letter (a-z, A-Z) or underscore (_)
+- Can contain letters, numbers, and underscores
+- Cannot contain spaces or special characters
+- Examples: `API_TOKEN`, `registry_url`, `AppVersion`, `_internal_var`
 
 ## Requirements
 
