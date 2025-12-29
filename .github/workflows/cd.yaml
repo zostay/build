@@ -68,6 +68,26 @@ on:
         required: false
         type: string
         default: '{}'
+      update-build-number:
+        description: 'Whether to update the build number in object store'
+        required: false
+        type: boolean
+        default: false
+      build-number-app-name:
+        description: 'Application name for build number (required if update-build-number is true)'
+        required: false
+        type: string
+        default: ''
+      build-number-image-name:
+        description: 'Image name for build number'
+        required: false
+        type: string
+        default: 'main'
+      build-number-env-name:
+        description: 'Environment name for build number'
+        required: false
+        type: string
+        default: 'prod'
     outputs:
       changes-made:
         description: 'Whether any manifest changes were made'
@@ -268,6 +288,38 @@ jobs:
 
             rm -f "$ENV_FILE"
           fi
+
+      - name: Update Build Number
+        if: inputs.update-build-number
+        env:
+          APP_NAME: ${{ inputs.build-number-app-name }}
+          IMAGE_NAME: ${{ inputs.build-number-image-name }}
+          ENV_NAME: ${{ inputs.build-number-env-name }}
+          BUILD_NUMBER: ${{ github.run_number }}.${{ github.run_attempt }}
+          AWS_ACCESS_KEY_ID: ${{ secrets.S3_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.S3_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION: ${{ vars.S3_DEFAULT_REGION }}
+          AWS_ENDPOINT_URL: ${{ vars.S3_ENDPOINT_URL }}
+          BUILD_NUMBER_BUCKET: ${{ vars.BUILD_NUMBER_BUCKET }}
+        run: |
+          set -euo pipefail
+
+          if [ -z "$APP_NAME" ]; then
+            echo "Error: build-number-app-name is required when update-build-number is true"
+            exit 1
+          fi
+
+          echo "Setting build number for ${APP_NAME}/${IMAGE_NAME}/${ENV_NAME} to ${BUILD_NUMBER}"
+
+          # Download the set-build-number script if it doesn't exist
+          if [ ! -f scripts/set-build-number ]; then
+            echo "Downloading set-build-number script from zostay/build repository..."
+            mkdir -p scripts
+            curl -fsSL https://raw.githubusercontent.com/zostay/build/master/scripts/set-build-number -o scripts/set-build-number
+            chmod +x scripts/set-build-number
+          fi
+
+          ./scripts/set-build-number "$APP_NAME" "$BUILD_NUMBER" --image-name "$IMAGE_NAME" --env-name "$ENV_NAME"
 
       - name: Validate Configuration
         working-directory: ${{ inputs.working-directory }}
