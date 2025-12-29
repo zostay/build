@@ -1,0 +1,181 @@
+#!/bin/bash
+set -euo pipefail
+
+# Script to set build number in S3-compatible object store
+# 
+# This script stores build number information in the qubling-cloud-config bucket
+# for automated deployments. It's designed to be copied to other projects and
+# used in GitHub Actions to set build numbers from CI/CD metadata.
+#
+# Supports any S3-compatible object store (AWS S3, Civo Object Store, MinIO, etc.)
+#
+# GitHub Actions Usage Example:
+# ================================
+#
+# 1. Set up object store credentials in your GitHub repository secrets:
+#    - S3_ACCESS_KEY_ID: Your object store access key
+#    - S3_SECRET_ACCESS_KEY: Your object store secret key
+#    - S3_REGION: Your object store region (e.g., us-east-1, NYC1)
+#    - S3_ENDPOINT_URL: (Optional) Custom endpoint for non-AWS S3 services
+#                       e.g., https://objectstore.nyc1.civo.com for Civo
+#
+# 2. In your GitHub Actions workflow (.github/workflows/build.yml):
+#
+#    name: Build and Deploy
+#    on:
+#      push:
+#        branches: [main]
+#    
+#    jobs:
+#      build:
+#        runs-on: ubuntu-latest
+#        environment: v4.qubling.cloud
+#        steps:
+#          - uses: actions/checkout@v4
+#          - name: Configure S3 credentials
+#          - name: Set build number
+#            env:
+#              AWS_ACCESS_KEY_ID: ${{ secrets.S3_ACCESS_KEY_ID }}
+#              AWS_SECRET_ACCESS_KEY: ${{ secrets.S3_SECRET_ACCESS_KEY }}
+#              AWS_DEFAULT_REGION: ${{ vars.S3_DEFAULT_REGION }}
+#              AWS_ENDPOINT_URL: ${{ vars.S3_ENDPOINT_URL }}
+#            run: |
+#              ./scripts/set-build-number myapp ${{ github.run_number }}.${{ github.run_attempt }}
+#              echo BUILD_TAG=${{ github.run_number }}.${{ github.run_attempt }} >> $GITHUB_ENV
+#
+# Required Secrets in GitHub:
+# - S3_ACCESS_KEY_ID: Access key for the object store
+# - S3_SECRET_ACCESS_KEY: Secret key for the object store  
+# - S3_REGION: Region where the bucket is located
+# - S3_ENDPOINT_URL: (Optional) Custom endpoint URL for non-AWS providers
+#
+# NOTE: The v4.qubling.cloud GitHub environment is already configured with:
+# - secrets.S3_ACCESS_KEY_ID and secrets.S3_SECRET_ACCESS_KEY for Civo object store access
+# - vars.S3_DEFAULT_REGION and vars.S3_ENDPOINT_URL for the Civo endpoint configuration
+#
+# The preferred build number is:
+# ${{ github.run_number }}.${{ github.run_attempt }}
+#
+# And this will be used to create a tag like:
+# master-$BUILD_TAG
+# prod-$BUILD_TAG
+# stg-$BUILD_TAG
+# etc. where the first word is the environment to deploy to.
+
+usage() {
+    echo "Usage: $0 <app-name> <build-number> [--image-name <name>] [--env-name <env>]"
+    echo "  app-name     - Required: Name of the application"
+    echo "  build-number - Required: Build number to store (any string)"
+    echo "  --image-name - Optional: Name of the image (default: main)"
+    echo "  --env-name   - Optional: Environment name (default: prod)"
+    echo ""
+    echo "Examples:"
+    echo "  $0 myapp 123"
+    echo "  $0 myapp v1.2.3 --image-name worker --env-name staging"
+    echo "  $0 myapp \${{ github.run_number }} --env-name prod"
+    exit 1
+}
+
+APP_NAME=""
+BUILD_NUMBER=""
+IMAGE_NAME="main"
+ENV_NAME="prod"
+BUCKET_NAME="${BUILD_NUMBER_BUCKET:-qubling-cloud-production}"
+
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        --image-name)
+            IMAGE_NAME="$2"
+            shift 2
+            ;;
+        --env-name)
+            ENV_NAME="$2"
+            shift 2
+            ;;
+        -h|--help)
+            usage
+            ;;
+        -*)
+            echo "Unknown option $1"
+            usage
+            ;;
+        *)
+            if [[ -z "$APP_NAME" ]]; then
+                APP_NAME="$1"
+                shift
+            elif [[ -z "$BUILD_NUMBER" ]]; then
+                BUILD_NUMBER="$1"
+                shift
+            else
+                echo "Unexpected argument: $1"
+                usage
+            fi
+            ;;
+    esac
+done
+
+if [[ -z "$APP_NAME" ]]; then
+    echo "Error: app-name is required"
+    usage
+fi
+
+if [[ -z "$BUILD_NUMBER" ]]; then
+    echo "Error: build-number is required"
+    usage
+fi
+
+OBJECT_KEY="build-number/${APP_NAME}/${IMAGE_NAME}/${ENV_NAME}.txt"
+
+# Validate required environment variables
+if [[ -z "${AWS_ACCESS_KEY_ID:-}" ]]; then
+    echo "Error: AWS_ACCESS_KEY_ID environment variable is required"
+    exit 1
+fi
+
+if [[ -z "${AWS_SECRET_ACCESS_KEY:-}" ]]; then
+    echo "Error: AWS_SECRET_ACCESS_KEY environment variable is required"
+    exit 1
+fi
+
+if [[ -z "${AWS_ENDPOINT_URL:-}" ]]; then
+    echo "Error: AWS_ENDPOINT_URL environment variable is required for S3-compatible services"
+    exit 1
+fi
+
+AWS_ACCESS_KEY_ID=$(echo -n "$AWS_ACCESS_KEY_ID" | tr -d '\r\n')
+AWS_SECRET_ACCESS_KEY=$(echo -n "$AWS_SECRET_ACCESS_KEY" | tr -d '\r\n')
+AWS_ENDPOINT_URL=$(echo -n "$AWS_ENDPOINT_URL" | tr -d '\r\n')
+
+# Create temporary file with the build number
+BUILD_FILE=$(mktemp)
+echo -n "$BUILD_NUMBER" > "$BUILD_FILE"
+
+# S3 V2 signature implementation (exact pattern from chatgpt.sh)
+# Extract hostname from AWS_ENDPOINT_URL for Host header 
+HOST_FOR_HEADER=$(echo "$AWS_ENDPOINT_URL" | cut -d'/' -f3)
+DATE=$(LC_ALL=C date -u +"%a, %d %b %Y %H:%M:%S +0000")
+STRING_TO_SIGN="PUT\n\ntext/plain\n${DATE}\n/${BUCKET_NAME}/${OBJECT_KEY}"
+SIGNATURE=$(echo -en "${STRING_TO_SIGN}" | openssl sha1 -hmac "$AWS_SECRET_ACCESS_KEY" -binary | base64)
+
+# Make the PUT request
+HTTP_CODE=$(curl -s -w "%{http_code}" -o /tmp/curl_output.txt -X PUT -T "${BUILD_FILE}" \
+  -H "Host: ${HOST_FOR_HEADER}" \
+  -H "Date: ${DATE}" \
+  -H "Content-Type: text/plain" \
+  -H "Authorization: AWS ${AWS_ACCESS_KEY_ID}:${SIGNATURE}" \
+  "${AWS_ENDPOINT_URL}/${BUCKET_NAME}/${OBJECT_KEY}") || cat /tmp/curl_output.txt
+
+# Clean up
+rm -f "$BUILD_FILE"
+
+if [[ "$HTTP_CODE" == "200" ]]; then
+    echo "Build number '$BUILD_NUMBER' stored for ${APP_NAME}/${IMAGE_NAME}/${ENV_NAME}"
+    rm -f /tmp/curl_output.txt
+else
+    echo "Error: Failed to store build number. HTTP status code: $HTTP_CODE"
+    if [[ -f /tmp/curl_output.txt ]]; then
+        cat /tmp/curl_output.txt
+        rm -f /tmp/curl_output.txt
+    fi
+    exit 1
+fi
