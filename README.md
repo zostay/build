@@ -105,6 +105,10 @@ jobs:
 | `git-user-name` | Git user name for commits | No | `github-actions[bot]` |
 | `git-user-email` | Git user email for commits | No | `github-actions[bot]@users.noreply.github.com` |
 | `environment-variables` | Environment variables to set for genifest execution (JSON format) | No | `'{}'` |
+| `update-build-number` | Whether to update the build number in object store | No | `false` |
+| `build-number-app-name` | Application name for build number (required if update-build-number is true) | No | `''` |
+| `build-number-image-name` | Image name for build number | No | `main` |
+| `build-number-env-name` | Environment name for build number | No | `prod` |
 
 #### Outputs
 
@@ -215,6 +219,85 @@ environment-variables: |
 - Can contain letters, numbers, and underscores
 - Cannot contain spaces or special characters
 - Examples: `API_TOKEN`, `registry_url`, `AppVersion`, `_internal_var`
+
+## Build Number Management
+
+The workflow can automatically update build numbers in an S3-compatible object store. This is useful for tracking which build number is deployed to specific environments, enabling coordinated deployments across multiple projects.
+
+### Features
+
+- **Automatic Build Numbers**: Build numbers are automatically set to `{run_number}.{run_attempt}` (e.g., "14.1")
+- **Multi-Environment Support**: Track build numbers for different environments (prod, staging, etc.)
+- **Multi-Image Support**: Track separate build numbers for different images within the same application
+- **S3-Compatible Storage**: Works with AWS S3, Civo Object Store, MinIO, or any S3-compatible service
+
+### Configuration
+
+To use build number tracking, you need to configure the following secrets and variables in your repository or GitHub environment:
+
+**Secrets:**
+- `S3_ACCESS_KEY_ID`: Access key for your object store
+- `S3_SECRET_ACCESS_KEY`: Secret key for your object store
+
+**Variables:**
+- `S3_DEFAULT_REGION`: Region where your bucket is located
+- `S3_ENDPOINT_URL`: Endpoint URL for your S3-compatible service (e.g., `https://objectstore.nyc1.civo.com`)
+- `BUILD_NUMBER_BUCKET`: (Optional) Name of the bucket to use (defaults to `qubling-cloud-production`)
+
+### Usage Example
+
+```yaml
+jobs:
+  deploy:
+    uses: zostay/build/.github/workflows/cd.yaml@main
+    with:
+      genifest-group: 'prod'
+      update-build-number: true
+      build-number-app-name: 'myapp'
+      build-number-image-name: 'main'
+      build-number-env-name: 'prod'
+    secrets: inherit
+```
+
+This will store the build number at the S3 path: `build-number/myapp/main/prod.txt`
+
+### Multiple Images Example
+
+If your application has multiple images (e.g., web server and worker):
+
+```yaml
+jobs:
+  deploy-web:
+    uses: zostay/build/.github/workflows/cd.yaml@main
+    with:
+      genifest-group: 'web'
+      update-build-number: true
+      build-number-app-name: 'myapp'
+      build-number-image-name: 'web'
+      build-number-env-name: 'prod'
+    secrets: inherit
+
+  deploy-worker:
+    uses: zostay/build/.github/workflows/cd.yaml@main
+    with:
+      genifest-group: 'worker'
+      update-build-number: true
+      build-number-app-name: 'myapp'
+      build-number-image-name: 'worker'
+      build-number-env-name: 'prod'
+    secrets: inherit
+```
+
+### How It Works
+
+When enabled, the workflow:
+1. Downloads the `set-build-number` script from this repository (if not already present)
+2. Constructs a build number from `github.run_number` and `github.run_attempt` (e.g., "14.1")
+3. Stores the build number as a text file in your S3-compatible object store at:
+   ```
+   build-number/{app-name}/{image-name}/{env-name}.txt
+   ```
+4. This build number can then be retrieved by other systems or workflows to coordinate deployments
 
 ## Requirements
 
