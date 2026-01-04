@@ -124,6 +124,9 @@ jobs:
 | `build-number-app-name` | Application name for build number (required if update-build-number is true) | No | `''` |
 | `build-number-image-name` | Image name for build number | No | `main` |
 | `build-number-env-name` | Environment name for build number | No | `prod` |
+| `aws-region` | AWS region for S3-compatible object store | No | `''` |
+| `aws-endpoint-url` | AWS endpoint URL for S3-compatible object store | No | `''` |
+| `build-number-bucket` | S3 bucket name for build number storage | No | `qubling-cloud-production` |
 
 #### Outputs
 
@@ -271,14 +274,20 @@ To use build number tracking, you need to configure the following secrets and va
 jobs:
   deploy:
     uses: zostay/build/.github/workflows/cd.yaml@main
+    environment: v4.qubling.cloud
     with:
       genifest-group: 'prod'
       update-build-number: true
       build-number-app-name: 'myapp'
       build-number-image-name: 'main'
       build-number-env-name: 'prod'
+      aws-region: ${{ vars.AWS_DEFAULT_REGION }}
+      aws-endpoint-url: ${{ vars.AWS_ENDPOINT_URL }}
+      build-number-bucket: ${{ vars.BUILD_NUMBER_BUCKET }}
     secrets: inherit
 ```
+
+**Note:** The `aws-region`, `aws-endpoint-url`, and `build-number-bucket` inputs must be passed from your environment's variables. The secrets (`AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY`) are automatically passed via `secrets: inherit`.
 
 This will store the build number at the S3 path: `build-number/myapp/main/prod.txt`
 
@@ -297,6 +306,9 @@ jobs:
       build-number-app-name: 'myapp'
       build-number-image-name: 'web'
       build-number-env-name: 'prod'
+      aws-region: ${{ vars.AWS_DEFAULT_REGION }}
+      aws-endpoint-url: ${{ vars.AWS_ENDPOINT_URL }}
+      build-number-bucket: ${{ vars.BUILD_NUMBER_BUCKET }}
     secrets: inherit
 
   deploy-worker:
@@ -308,6 +320,9 @@ jobs:
       build-number-app-name: 'myapp'
       build-number-image-name: 'worker'
       build-number-env-name: 'prod'
+      aws-region: ${{ vars.AWS_DEFAULT_REGION }}
+      aws-endpoint-url: ${{ vars.AWS_ENDPOINT_URL }}
+      build-number-bucket: ${{ vars.BUILD_NUMBER_BUCKET }}
     secrets: inherit
 ```
 

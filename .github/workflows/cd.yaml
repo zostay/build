@@ -88,6 +88,21 @@ on:
         required: false
         type: string
         default: 'prod'
+      aws-region:
+        description: 'AWS region for S3-compatible object store'
+        required: false
+        type: string
+        default: ''
+      aws-endpoint-url:
+        description: 'AWS endpoint URL for S3-compatible object store'
+        required: false
+        type: string
+        default: ''
+      build-number-bucket:
+        description: 'S3 bucket name for build number storage'
+        required: false
+        type: string
+        default: 'qubling-cloud-production'
     secrets:
       AWS_ACCESS_KEY_ID:
         description: 'AWS access key ID for S3-compatible object store'
@@ -305,9 +320,9 @@ jobs:
           BUILD_NUMBER: ${{ github.run_number }}.${{ github.run_attempt }}
           AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          AWS_DEFAULT_REGION: ${{ vars.AWS_DEFAULT_REGION }}
-          AWS_ENDPOINT_URL: ${{ vars.AWS_ENDPOINT_URL }}
-          BUILD_NUMBER_BUCKET: ${{ vars.BUILD_NUMBER_BUCKET }}
+          AWS_DEFAULT_REGION: ${{ inputs.aws-region }}
+          AWS_ENDPOINT_URL: ${{ inputs.aws-endpoint-url }}
+          BUILD_NUMBER_BUCKET: ${{ inputs.build-number-bucket }}
         run: |
           set -euo pipefail
 
