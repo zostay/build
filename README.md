@@ -236,12 +236,12 @@ The workflow can automatically update build numbers in an S3-compatible object s
 To use build number tracking, you need to configure the following secrets and variables in your repository or GitHub environment:
 
 **Secrets:**
-- `S3_ACCESS_KEY_ID`: Access key for your object store
-- `S3_SECRET_ACCESS_KEY`: Secret key for your object store
+- `AWS_ACCESS_KEY_ID`: Access key for your object store
+- `AWS_SECRET_ACCESS_KEY`: Secret key for your object store
 
 **Variables:**
-- `S3_DEFAULT_REGION`: Region where your bucket is located
-- `S3_ENDPOINT_URL`: Endpoint URL for your S3-compatible service (e.g., `https://objectstore.nyc1.civo.com`)
+- `AWS_DEFAULT_REGION`: Region where your bucket is located
+- `AWS_ENDPOINT_URL`: Endpoint URL for your S3-compatible service (e.g., `https://objectstore.nyc1.civo.com`)
 - `BUILD_NUMBER_BUCKET`: (Optional) Name of the bucket to use (defaults to `qubling-cloud-production`)
 
 ### Usage Example

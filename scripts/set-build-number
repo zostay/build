@@ -13,11 +13,11 @@ set -euo pipefail
 # ================================
 #
 # 1. Set up object store credentials in your GitHub repository secrets:
-#    - S3_ACCESS_KEY_ID: Your object store access key
-#    - S3_SECRET_ACCESS_KEY: Your object store secret key
-#    - S3_REGION: Your object store region (e.g., us-east-1, NYC1)
-#    - S3_ENDPOINT_URL: (Optional) Custom endpoint for non-AWS S3 services
-#                       e.g., https://objectstore.nyc1.civo.com for Civo
+#    - AWS_ACCESS_KEY_ID: Your object store access key
+#    - AWS_SECRET_ACCESS_KEY: Your object store secret key
+#    - AWS_DEFAULT_REGION: Your object store region (e.g., us-east-1, NYC1)
+#    - AWS_ENDPOINT_URL: (Optional) Custom endpoint for non-AWS S3 services
+#                        e.g., https://objectstore.nyc1.civo.com for Civo
 #
 # 2. In your GitHub Actions workflow (.github/workflows/build.yml):
 #
@@ -35,23 +35,23 @@ set -euo pipefail
 #          - name: Configure S3 credentials
 #          - name: Set build number
 #            env:
-#              AWS_ACCESS_KEY_ID: ${{ secrets.S3_ACCESS_KEY_ID }}
-#              AWS_SECRET_ACCESS_KEY: ${{ secrets.S3_SECRET_ACCESS_KEY }}
-#              AWS_DEFAULT_REGION: ${{ vars.S3_DEFAULT_REGION }}
-#              AWS_ENDPOINT_URL: ${{ vars.S3_ENDPOINT_URL }}
+#              AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+#              AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+#              AWS_DEFAULT_REGION: ${{ vars.AWS_DEFAULT_REGION }}
+#              AWS_ENDPOINT_URL: ${{ vars.AWS_ENDPOINT_URL }}
 #            run: |
 #              ./scripts/set-build-number myapp ${{ github.run_number }}.${{ github.run_attempt }}
 #              echo BUILD_TAG=${{ github.run_number }}.${{ github.run_attempt }} >> $GITHUB_ENV
 #
 # Required Secrets in GitHub:
-# - S3_ACCESS_KEY_ID: Access key for the object store
-# - S3_SECRET_ACCESS_KEY: Secret key for the object store  
-# - S3_REGION: Region where the bucket is located
-# - S3_ENDPOINT_URL: (Optional) Custom endpoint URL for non-AWS providers
+# - AWS_ACCESS_KEY_ID: Access key for the object store
+# - AWS_SECRET_ACCESS_KEY: Secret key for the object store
+# - AWS_DEFAULT_REGION: Region where the bucket is located
+# - AWS_ENDPOINT_URL: (Optional) Custom endpoint URL for non-AWS providers
 #
 # NOTE: The v4.qubling.cloud GitHub environment is already configured with:
-# - secrets.S3_ACCESS_KEY_ID and secrets.S3_SECRET_ACCESS_KEY for Civo object store access
-# - vars.S3_DEFAULT_REGION and vars.S3_ENDPOINT_URL for the Civo endpoint configuration
+# - secrets.AWS_ACCESS_KEY_ID and secrets.AWS_SECRET_ACCESS_KEY for Civo object store access
+# - vars.AWS_DEFAULT_REGION and vars.AWS_ENDPOINT_URL for the Civo endpoint configuration
 #
 # The preferred build number is:
 # ${{ github.run_number }}.${{ github.run_attempt }}
