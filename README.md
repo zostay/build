@@ -13,6 +13,15 @@ A reusable workflow for continuous deployment that uses genifest to update Kuber
 3. Runs genifest to update manifests
 4. Optionally commits and pushes the changes
 
+#### Important: Environment Configuration
+
+**All workflows using this reusable workflow MUST specify `environment: v4.qubling.cloud`** to ensure secrets and variables are sourced from the correct GitHub environment. This environment should contain:
+
+- **Secrets**: `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`
+- **Variables**: `AWS_DEFAULT_REGION`, `AWS_ENDPOINT_URL`, `BUILD_NUMBER_BUCKET`
+
+All examples below include `environment: v4.qubling.cloud` and `secrets: inherit` to demonstrate this requirement.
+
 #### Basic Usage
 
 ```yaml
@@ -25,6 +34,8 @@ on:
 jobs:
   deploy:
     uses: zostay/build/.github/workflows/cd.yaml@main
+    environment: v4.qubling.cloud
+    secrets: inherit
 ```
 
 #### Example with Pull Request Creation
@@ -40,6 +51,7 @@ on:
 jobs:
   create-deployment-pr:
     uses: zostay/build/.github/workflows/cd.yaml@main
+    environment: v4.qubling.cloud
     with:
       genifest-version: 'latest'
       genifest-group: 'prod'
@@ -51,6 +63,7 @@ jobs:
       create-pr: true                     # enable PR creation
       pr-target-branch: 'deploy-prod'     # optional: custom target branch
       commit-message: 'chore: update production manifests'
+    secrets: inherit
 ```
 
 This workflow will:
@@ -72,6 +85,7 @@ on:
 jobs:
   update-manifests:
     uses: zostay/build/.github/workflows/cd.yaml@main
+    environment: v4.qubling.cloud
     with:
       genifest-version: 'latest'          # or specific version like '1.0.0-rc6'
       genifest-group: 'prod'              # genifest group to run
@@ -86,6 +100,7 @@ jobs:
       git-user-name: 'github-actions[bot]'
       git-user-email: 'github-actions[bot]@users.noreply.github.com'
       environment-variables: '{"REGISTRY_URL":"ghcr.io","APP_VERSION":"v1.2.3","DEBUG":"true"}'
+    secrets: inherit
 ```
 
 #### Inputs
@@ -125,9 +140,11 @@ jobs:
 jobs:
   update-manifests:
     uses: zostay/build/.github/workflows/cd.yaml@main
+    environment: v4.qubling.cloud
     with:
       genifest-group: 'prod'
       create-pr: true
+    secrets: inherit
 
   notify:
     needs: update-manifests
@@ -176,9 +193,11 @@ Environment variables are passed as a JSON string using the `environment-variabl
 jobs:
   deploy:
     uses: zostay/build/.github/workflows/cd.yaml@main
+    environment: v4.qubling.cloud
     with:
       genifest-group: 'prod'
       environment-variables: '{"API_TOKEN":"${{ secrets.API_TOKEN }}","REGISTRY_URL":"ghcr.io","APP_VERSION":"v1.2.3"}'
+    secrets: inherit
 ```
 
 ### Features
@@ -233,7 +252,7 @@ The workflow can automatically update build numbers in an S3-compatible object s
 
 ### Configuration
 
-To use build number tracking, you need to configure the following secrets and variables in your repository or GitHub environment:
+To use build number tracking, you need to configure the following secrets and variables in the **v4.qubling.cloud** GitHub environment:
 
 **Secrets:**
 - `AWS_ACCESS_KEY_ID`: Access key for your object store
@@ -243,6 +262,8 @@ To use build number tracking, you need to configure the following secrets and va
 - `AWS_DEFAULT_REGION`: Region where your bucket is located
 - `AWS_ENDPOINT_URL`: Endpoint URL for your S3-compatible service (e.g., `https://objectstore.nyc1.civo.com`)
 - `BUILD_NUMBER_BUCKET`: (Optional) Name of the bucket to use (defaults to `qubling-cloud-production`)
+
+**Note:** These secrets and variables should be configured in the v4.qubling.cloud environment in your GitHub repository settings.
 
 ### Usage Example
 
@@ -269,6 +290,7 @@ If your application has multiple images (e.g., web server and worker):
 jobs:
   deploy-web:
     uses: zostay/build/.github/workflows/cd.yaml@main
+    environment: v4.qubling.cloud
     with:
       genifest-group: 'web'
       update-build-number: true
@@ -279,6 +301,7 @@ jobs:
 
   deploy-worker:
     uses: zostay/build/.github/workflows/cd.yaml@main
+    environment: v4.qubling.cloud
     with:
       genifest-group: 'worker'
       update-build-number: true

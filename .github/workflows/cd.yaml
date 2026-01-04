@@ -88,6 +88,13 @@ on:
         required: false
         type: string
         default: 'prod'
+    secrets:
+      AWS_ACCESS_KEY_ID:
+        description: 'AWS access key ID for S3-compatible object store'
+        required: false
+      AWS_SECRET_ACCESS_KEY:
+        description: 'AWS secret access key for S3-compatible object store'
+        required: false
     outputs:
       changes-made:
         description: 'Whether any manifest changes were made'
