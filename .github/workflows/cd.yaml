@@ -1,5 +1,24 @@
 name: Continuous Deployment
 
+# IMPORTANT: Calling workflows MUST specify 'environment: v4.qubling.cloud'
+# to ensure AWS secrets (AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY) and
+# variables (AWS_DEFAULT_REGION, AWS_ENDPOINT_URL, BUILD_NUMBER_BUCKET)
+# are sourced from the v4.qubling.cloud GitHub environment.
+#
+# Example:
+#   jobs:
+#     deploy:
+#       uses: zostay/build/.github/workflows/cd.yaml@main
+#       environment: v4.qubling.cloud
+#       with:
+#         genifest-group: 'prod'
+#         update-build-number: true
+#         build-number-app-name: 'myapp'
+#         aws-region: ${{ vars.AWS_DEFAULT_REGION }}
+#         aws-endpoint-url: ${{ vars.AWS_ENDPOINT_URL }}
+#         build-number-bucket: ${{ vars.BUILD_NUMBER_BUCKET }}
+#       secrets: inherit
+
 on:
   workflow_call:
     inputs:
@@ -328,6 +347,31 @@ jobs:
 
           if [ -z "$APP_NAME" ]; then
             echo "Error: build-number-app-name is required when update-build-number is true"
+            exit 1
+          fi
+
+          # Validate required secrets and variables are provided from v4.qubling.cloud environment
+          if [ -z "${AWS_ACCESS_KEY_ID:-}" ]; then
+            echo "Error: AWS_ACCESS_KEY_ID secret is required"
+            echo "Ensure the calling workflow specifies 'environment: v4.qubling.cloud' and 'secrets: inherit'"
+            exit 1
+          fi
+
+          if [ -z "${AWS_SECRET_ACCESS_KEY:-}" ]; then
+            echo "Error: AWS_SECRET_ACCESS_KEY secret is required"
+            echo "Ensure the calling workflow specifies 'environment: v4.qubling.cloud' and 'secrets: inherit'"
+            exit 1
+          fi
+
+          if [ -z "${AWS_DEFAULT_REGION:-}" ]; then
+            echo "Error: aws-region input is required"
+            echo "Pass it from your environment: aws-region: \${{ vars.AWS_DEFAULT_REGION }}"
+            exit 1
+          fi
+
+          if [ -z "${AWS_ENDPOINT_URL:-}" ]; then
+            echo "Error: aws-endpoint-url input is required"
+            echo "Pass it from your environment: aws-endpoint-url: \${{ vars.AWS_ENDPOINT_URL }}"
             exit 1
           fi
 
