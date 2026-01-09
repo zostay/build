@@ -151,11 +151,16 @@ BUILD_FILE=$(mktemp)
 echo -n "$BUILD_NUMBER" > "$BUILD_FILE"
 
 # S3 V2 signature implementation (exact pattern from chatgpt.sh)
-# Extract hostname from AWS_ENDPOINT_URL for Host header 
+# Extract hostname from AWS_ENDPOINT_URL for Host header
 HOST_FOR_HEADER=$(echo "$AWS_ENDPOINT_URL" | cut -d'/' -f3)
 DATE=$(LC_ALL=C date -u +"%a, %d %b %Y %H:%M:%S +0000")
-STRING_TO_SIGN="PUT\n\ntext/plain\n${DATE}\n/${BUCKET_NAME}/${OBJECT_KEY}"
-SIGNATURE=$(echo -en "${STRING_TO_SIGN}" | openssl sha1 -hmac "$AWS_SECRET_ACCESS_KEY" -binary | base64)
+# Build string to sign using printf for safety
+STRING_TO_SIGN="PUT
+
+text/plain
+${DATE}
+/${BUCKET_NAME}/${OBJECT_KEY}"
+SIGNATURE=$(printf '%s' "$STRING_TO_SIGN" | openssl sha1 -hmac "$AWS_SECRET_ACCESS_KEY" -binary | base64)
 
 # Make the PUT request
 HTTP_CODE=$(curl -s -w "%{http_code}" -o /tmp/curl_output.txt -X PUT -T "${BUILD_FILE}" \
@@ -163,16 +168,19 @@ HTTP_CODE=$(curl -s -w "%{http_code}" -o /tmp/curl_output.txt -X PUT -T "${BUILD
   -H "Date: ${DATE}" \
   -H "Content-Type: text/plain" \
   -H "Authorization: AWS ${AWS_ACCESS_KEY_ID}:${SIGNATURE}" \
-  "${AWS_ENDPOINT_URL}/${BUCKET_NAME}/${OBJECT_KEY}") || cat /tmp/curl_output.txt
+  "${AWS_ENDPOINT_URL}/${BUCKET_NAME}/${OBJECT_KEY}" 2>&1) || {
+    cat /tmp/curl_output.txt
+    HTTP_CODE="000"
+  }
 
 # Clean up
 rm -f "$BUILD_FILE"
 
 if [[ "$HTTP_CODE" == "200" ]]; then
-    echo "Build number '$BUILD_NUMBER' stored for ${APP_NAME}/${IMAGE_NAME}/${ENV_NAME}"
+    printf 'Build number %s stored for %s/%s/%s\n' "$BUILD_NUMBER" "$APP_NAME" "$IMAGE_NAME" "$ENV_NAME"
     rm -f /tmp/curl_output.txt
 else
-    echo "Error: Failed to store build number. HTTP status code: $HTTP_CODE"
+    printf 'Error: Failed to store build number. HTTP status code: %s\n' "$HTTP_CODE"
     if [[ -f /tmp/curl_output.txt ]]; then
         cat /tmp/curl_output.txt
         rm -f /tmp/curl_output.txt
