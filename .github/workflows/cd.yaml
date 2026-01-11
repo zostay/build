@@ -365,13 +365,13 @@ jobs:
 
           if [ -z "${AWS_DEFAULT_REGION:-}" ]; then
             echo "Error: aws-region input is required"
-            echo "Pass it from your environment: aws-region: \${{ vars.AWS_DEFAULT_REGION }}"
+            echo 'Pass it from your environment: aws-region: ${{ vars.AWS_DEFAULT_REGION }}'
             exit 1
           fi
 
           if [ -z "${AWS_ENDPOINT_URL:-}" ]; then
             echo "Error: aws-endpoint-url input is required"
-            echo "Pass it from your environment: aws-endpoint-url: \${{ vars.AWS_ENDPOINT_URL }}"
+            echo 'Pass it from your environment: aws-endpoint-url: ${{ vars.AWS_ENDPOINT_URL }}'
             exit 1
           fi
 
