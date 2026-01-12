@@ -403,6 +403,10 @@ jobs:
           GENIFEST_TAG: ${{ inputs.genifest-tag }}
           OUTPUT_MODE: ${{ inputs.output-mode }}
           BUILD_TAG: ${{ env.BUILD_TAG }}
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION: ${{ inputs.aws-region }}
+          AWS_ENDPOINT_URL: ${{ inputs.aws-endpoint-url }}
         run: |
           set -euo pipefail
 
