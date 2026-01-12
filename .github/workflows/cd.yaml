@@ -142,11 +142,6 @@ on:
         required: false
         type: string
         default: ''
-      mysql-database:
-        description: 'MySQL database name'
-        required: false
-        type: string
-        default: ''
     secrets:
       AWS_ACCESS_KEY_ID:
         description: 'AWS access key ID for S3-compatible object store'
@@ -436,7 +431,6 @@ jobs:
           AWS_DEPLOY_URL: ${{ inputs.aws-deploy-url }}
           AWS_BUILD_URL: ${{ inputs.aws-build-url }}
           MYSQL_HOST: ${{ inputs.mysql-host }}
-          MYSQL_DATABASE: ${{ inputs.mysql-database }}
         run: |
           set -euo pipefail
 
