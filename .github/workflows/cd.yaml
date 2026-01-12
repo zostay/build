@@ -122,6 +122,21 @@ on:
         required: false
         type: string
         default: 'qubling-cloud-production'
+      aws-bucket-name:
+        description: 'AWS bucket name for S3 operations'
+        required: false
+        type: string
+        default: ''
+      aws-deploy-url:
+        description: 'AWS S3 URL for deployments'
+        required: false
+        type: string
+        default: ''
+      aws-build-url:
+        description: 'AWS S3 URL for build artifacts'
+        required: false
+        type: string
+        default: ''
     secrets:
       AWS_ACCESS_KEY_ID:
         description: 'AWS access key ID for S3-compatible object store'
@@ -407,6 +422,9 @@ jobs:
           AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           AWS_DEFAULT_REGION: ${{ inputs.aws-region }}
           AWS_ENDPOINT_URL: ${{ inputs.aws-endpoint-url }}
+          AWS_BUCKET_NAME: ${{ inputs.aws-bucket-name }}
+          AWS_DEPLOY_URL: ${{ inputs.aws-deploy-url }}
+          AWS_BUILD_URL: ${{ inputs.aws-build-url }}
         run: |
           set -euo pipefail
 
