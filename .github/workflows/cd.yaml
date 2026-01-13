@@ -137,17 +137,15 @@ on:
         required: false
         type: string
         default: ''
-      mysql-host:
-        description: 'MySQL database host'
-        required: false
-        type: string
-        default: ''
     secrets:
       AWS_ACCESS_KEY_ID:
         description: 'AWS access key ID for S3-compatible object store'
         required: false
       AWS_SECRET_ACCESS_KEY:
         description: 'AWS secret access key for S3-compatible object store'
+        required: false
+      MYSQL_HOST:
+        description: 'MySQL database host'
         required: false
     outputs:
       changes-made:
@@ -430,7 +428,7 @@ jobs:
           AWS_BUCKET_NAME: ${{ inputs.aws-bucket-name }}
           AWS_DEPLOY_URL: ${{ inputs.aws-deploy-url }}
           AWS_BUILD_URL: ${{ inputs.aws-build-url }}
-          MYSQL_HOST: ${{ inputs.mysql-host }}
+          MYSQL_HOST: ${{ secrets.MYSQL_HOST }}
         run: |
           set -euo pipefail
 
