@@ -193,17 +193,27 @@ jobs:
         if: inputs.create-pr
         env:
           TARGET_BRANCH: ${{ inputs.pr-target-branch }}
+          BASE_REF: ${{ github.base_ref }}
+          REF_NAME: ${{ github.ref_name }}
         run: |
           set -euo pipefail
 
+          # Determine the base branch name for deployment target
+          # Use base_ref if this is a PR, otherwise use ref_name
+          if [ -n "$BASE_REF" ]; then
+            BASE_BRANCH="$BASE_REF"
+          else
+            BASE_BRANCH="$REF_NAME"
+          fi
+
           # Set up branch names
           if [ -z "$TARGET_BRANCH" ]; then
-            DEPLOY_TARGET="deploy-${{ github.ref_name }}"
+            DEPLOY_TARGET="deploy-$BASE_BRANCH"
           else
             DEPLOY_TARGET="$TARGET_BRANCH"
           fi
 
-          BUILD_TAG="${{ github.ref_name }}-${{ github.run_number }}.${{ github.run_attempt }}"
+          BUILD_TAG="$BASE_BRANCH-${{ github.run_number }}.${{ github.run_attempt }}"
           BRANCH_NAME="deploy-$BUILD_TAG-$(date +%Y%m%d-%H%M%S)"
 
           echo "DEPLOY_TARGET=$DEPLOY_TARGET" >> $GITHUB_ENV
@@ -216,7 +226,7 @@ jobs:
 
           # Check if the deploy-* branch exists
           if git ls-remote --exit-code --heads origin "$DEPLOY_TARGET" > /dev/null 2>&1; then
-            echo "Deploy branch $DEPLOY_TARGET exists, updating it with latest changes from ${{ github.ref_name }}"
+            echo "Deploy branch $DEPLOY_TARGET exists, updating it with latest changes from $BASE_BRANCH"
             # Fetch the existing deploy branch
             git fetch origin "$DEPLOY_TARGET:$DEPLOY_TARGET"
             # Create new deployment branch from current HEAD (which has latest changes)
@@ -421,6 +431,8 @@ jobs:
           GENIFEST_TAG: ${{ inputs.genifest-tag }}
           OUTPUT_MODE: ${{ inputs.output-mode }}
           BUILD_TAG: ${{ env.BUILD_TAG }}
+          BASE_REF: ${{ github.base_ref }}
+          REF_NAME: ${{ github.ref_name }}
           AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           AWS_DEFAULT_REGION: ${{ inputs.aws-region }}
@@ -432,12 +444,19 @@ jobs:
         run: |
           set -euo pipefail
 
+          # Determine the base branch name
+          if [ -n "$BASE_REF" ]; then
+            BASE_BRANCH="$BASE_REF"
+          else
+            BASE_BRANCH="$REF_NAME"
+          fi
+
           # Create genifest log with detailed information
           {
             echo "# Genifest Deployment Report"
             echo
-            echo "**Branch:** ${{ github.ref_name }}"
-            echo "**Build Tag:** ${BUILD_TAG:-${{ github.ref_name }}-${{ github.run_number }}.${{ github.run_attempt }}}"
+            echo "**Branch:** $BASE_BRANCH"
+            echo "**Build Tag:** ${BUILD_TAG:-$BASE_BRANCH-${{ github.run_number }}.${{ github.run_attempt }}}"
             echo "**Genifest Group:** $GENIFEST_GROUP"
             echo "**Timestamp:** $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
             echo
