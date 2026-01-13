@@ -548,7 +548,7 @@ jobs:
 
       - name: Create Pull Request
         id: create-pr
-        if: inputs.create-pr && steps.check-changes.outputs.changes-made == 'true'
+        if: inputs.create-pr && inputs.commit-changes && inputs.push-changes && steps.check-changes.outputs.changes-made == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
           DEPLOY_TARGET: ${{ env.DEPLOY_TARGET }}
