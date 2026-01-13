@@ -557,19 +557,30 @@ jobs:
         run: |
           set -euo pipefail
 
-          PR_TITLE="Deploy ${BUILD_TAG} $(date +%Y%m%d-%H%M%S)"
+          # Check if deploy target branch exists on remote
+          if ! git ls-remote --exit-code --heads origin "$DEPLOY_TARGET" > /dev/null 2>&1; then
+            echo "Deploy target branch $DEPLOY_TARGET does not exist, creating it"
+            # Push current branch to create the deploy target
+            git push origin "$BRANCH_NAME:$DEPLOY_TARGET"
+            echo "Created deploy branch $DEPLOY_TARGET from $BRANCH_NAME"
+            echo "pr-number=" >> $GITHUB_OUTPUT
+            echo "pr-url=" >> $GITHUB_OUTPUT
+          else
+            echo "Deploy target branch $DEPLOY_TARGET exists, creating pull request"
+            PR_TITLE="Deploy ${BUILD_TAG} $(date +%Y%m%d-%H%M%S)"
 
-          # Create PR with genifest log as the body
-          PR_URL=$(gh pr create \
-            --base "$DEPLOY_TARGET" \
-            --head "$BRANCH_NAME" \
-            --title "$PR_TITLE" \
-            --body-file genifest.log)
+            # Create PR with genifest log as the body
+            PR_URL=$(gh pr create \
+              --base "$DEPLOY_TARGET" \
+              --head "$BRANCH_NAME" \
+              --title "$PR_TITLE" \
+              --body-file genifest.log)
 
-          # Extract PR number from URL
-          PR_NUMBER=$(echo "$PR_URL" | sed 's/.*\/pull\/\([0-9]*\)/\1/')
+            # Extract PR number from URL
+            PR_NUMBER=$(echo "$PR_URL" | sed 's/.*\/pull\/\([0-9]*\)/\1/')
 
-          echo "pr-number=$PR_NUMBER" >> $GITHUB_OUTPUT
-          echo "pr-url=$PR_URL" >> $GITHUB_OUTPUT
+            echo "pr-number=$PR_NUMBER" >> $GITHUB_OUTPUT
+            echo "pr-url=$PR_URL" >> $GITHUB_OUTPUT
 
-          echo "Created pull request: $PR_URL"
+            echo "Created pull request: $PR_URL"
+          fi
