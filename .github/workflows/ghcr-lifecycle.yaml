@@ -1,0 +1,267 @@
+name: GHCR Lifecycle Management
+
+# Manages container image lifecycle in GitHub Container Registry (ghcr.io).
+# Similar to AWS ECR lifecycle policies - prunes old images while keeping
+# a minimum number of recent versions.
+#
+# Example (scheduled cleanup):
+#   on:
+#     schedule:
+#       - cron: '0 0 * * 0'  # Weekly on Sunday at midnight
+#     workflow_dispatch:      # Allow manual runs
+#
+#   jobs:
+#     cleanup:
+#       uses: zostay/build/.github/workflows/ghcr-lifecycle.yaml@master
+#       with:
+#         package-name: 'myapp'
+#         min-versions-to-keep: 10
+#         max-age-days: 30
+#       secrets:
+#         GHCR_TOKEN: ${{ secrets.GHCR_TOKEN }}
+#
+# Note: The GHCR_TOKEN must be a PAT with read:packages and delete:packages
+# scopes, or use GITHUB_TOKEN if the workflow has packages: write permission.
+
+on:
+  workflow_call:
+    inputs:
+      package-name:
+        description: 'Name of the container package to manage'
+        required: true
+        type: string
+      package-owner:
+        description: 'Owner of the package (user or org). Defaults to repository owner.'
+        required: false
+        type: string
+        default: ''
+      min-versions-to-keep:
+        description: 'Minimum number of versions to keep regardless of age'
+        required: false
+        type: number
+        default: 10
+      max-age-days:
+        description: 'Maximum age in days before a version is eligible for deletion'
+        required: false
+        type: number
+        default: 30
+      dry-run:
+        description: 'If true, only report what would be deleted without actually deleting'
+        required: false
+        type: boolean
+        default: false
+      include-untagged:
+        description: 'If true, include untagged versions in cleanup (recommended)'
+        required: false
+        type: boolean
+        default: true
+      protected-tags:
+        description: 'Comma-separated list of tag patterns to never delete (e.g., "latest,v*,prod-*")'
+        required: false
+        type: string
+        default: 'latest'
+    secrets:
+      GHCR_TOKEN:
+        description: 'GitHub token with packages read/delete permissions (PAT or GITHUB_TOKEN)'
+        required: true
+    outputs:
+      deleted-count:
+        description: 'Number of versions deleted'
+        value: ${{ jobs.cleanup.outputs.deleted-count }}
+      kept-count:
+        description: 'Number of versions kept'
+        value: ${{ jobs.cleanup.outputs.kept-count }}
+      dry-run-would-delete:
+        description: 'Number of versions that would be deleted (dry-run only)'
+        value: ${{ jobs.cleanup.outputs.dry-run-would-delete }}
+
+jobs:
+  cleanup:
+    name: Cleanup Old Images
+    runs-on: ubuntu-latest
+    outputs:
+      deleted-count: ${{ steps.cleanup.outputs.deleted-count }}
+      kept-count: ${{ steps.cleanup.outputs.kept-count }}
+      dry-run-would-delete: ${{ steps.cleanup.outputs.dry-run-would-delete }}
+    steps:
+      - name: Cleanup Container Versions
+        id: cleanup
+        env:
+          GH_TOKEN: ${{ secrets.GHCR_TOKEN }}
+          PACKAGE_NAME: ${{ inputs.package-name }}
+          PACKAGE_OWNER: ${{ inputs.package-owner || github.repository_owner }}
+          MIN_VERSIONS: ${{ inputs.min-versions-to-keep }}
+          MAX_AGE_DAYS: ${{ inputs.max-age-days }}
+          DRY_RUN: ${{ inputs.dry-run }}
+          INCLUDE_UNTAGGED: ${{ inputs.include-untagged }}
+          PROTECTED_TAGS: ${{ inputs.protected-tags }}
+        run: |
+          set -euo pipefail
+
+          echo "=== GHCR Lifecycle Management ==="
+          echo "Package: $PACKAGE_OWNER/$PACKAGE_NAME"
+          echo "Min versions to keep: $MIN_VERSIONS"
+          echo "Max age (days): $MAX_AGE_DAYS"
+          echo "Dry run: $DRY_RUN"
+          echo "Include untagged: $INCLUDE_UNTAGGED"
+          echo "Protected tags: $PROTECTED_TAGS"
+          echo
+
+          # Calculate cutoff timestamp (seconds since epoch)
+          CUTOFF_EPOCH=$(date -u -d "$MAX_AGE_DAYS days ago" +%s)
+          CUTOFF_DATE=$(date -u -d "@$CUTOFF_EPOCH" +%Y-%m-%dT%H:%M:%SZ)
+          echo "Cutoff date: $CUTOFF_DATE"
+          echo
+
+          # Determine if owner is a user or org
+          OWNER_TYPE=$(gh api "users/$PACKAGE_OWNER" --jq '.type' 2>/dev/null || echo "Organization")
+
+          if [ "$OWNER_TYPE" = "User" ]; then
+            API_PATH="users/$PACKAGE_OWNER/packages/container/$PACKAGE_NAME/versions"
+          else
+            API_PATH="orgs/$PACKAGE_OWNER/packages/container/$PACKAGE_NAME/versions"
+          fi
+
+          echo "Owner type: $OWNER_TYPE"
+          echo "Using API path: $API_PATH"
+          echo
+
+          # Fetch all versions (paginated) and sort by creation date (newest first)
+          echo "Fetching package versions..."
+          VERSIONS_JSON=$(gh api --paginate "$API_PATH" \
+            --jq '[.[] | {id: .id, name: .name, created_at: .created_at, tags: (.metadata.container.tags // [])}] | sort_by(.created_at) | reverse' \
+            2>/dev/null || echo "[]")
+
+          TOTAL_VERSIONS=$(echo "$VERSIONS_JSON" | jq 'length')
+
+          if [ "$TOTAL_VERSIONS" -eq 0 ]; then
+            echo "No versions found for package $PACKAGE_NAME"
+            echo "deleted-count=0" >> $GITHUB_OUTPUT
+            echo "kept-count=0" >> $GITHUB_OUTPUT
+            echo "dry-run-would-delete=0" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          echo "Total versions found: $TOTAL_VERSIONS"
+          echo
+
+          # Build protected tag regex from glob patterns
+          build_regex() {
+            local patterns="$1"
+            if [ -z "$patterns" ]; then
+              echo ""
+              return
+            fi
+            echo "$patterns" | tr ',' '\n' | while read -r pattern; do
+              pattern=$(echo "$pattern" | xargs)  # trim whitespace
+              [ -z "$pattern" ] && continue
+              # Escape regex special chars, then convert globs
+              echo "$pattern" | sed 's/[.^$+?{}|()\\[\\]]/\\&/g; s/\*/.*/g'
+            done | paste -sd '|' -
+          }
+
+          PROTECTED_REGEX=$(build_regex "$PROTECTED_TAGS")
+          if [ -n "$PROTECTED_REGEX" ]; then
+            echo "Protected tag regex: ^($PROTECTED_REGEX)$"
+            echo
+          fi
+
+          # Process versions using jq to handle the logic
+          # This avoids subshell issues with while loops
+          RESULTS=$(echo "$VERSIONS_JSON" | jq -r --arg cutoff "$CUTOFF_EPOCH" \
+            --arg min_versions "$MIN_VERSIONS" \
+            --arg include_untagged "$INCLUDE_UNTAGGED" \
+            --arg protected_regex "$PROTECTED_REGEX" '
+            def is_protected($tags; $regex):
+              if $regex == "" then false
+              elif ($tags | length) == 0 then false
+              else ($tags | any(. as $tag | $tag | test("^(" + $regex + ")$")))
+              end;
+
+            def is_old($created_at; $cutoff):
+              ($created_at | sub("\\.[0-9]+Z$"; "Z") | fromdateiso8601) < ($cutoff | tonumber);
+
+            reduce .[] as $v (
+              {kept: 0, protected: 0, to_delete: [], to_keep: []};
+
+              ($v.tags | length) as $tag_count |
+              ($tag_count == 0) as $is_untagged |
+              is_protected($v.tags; $protected_regex) as $is_protected |
+              is_old($v.created_at; $cutoff) as $is_old |
+
+              if $is_protected then
+                .protected += 1 |
+                .to_keep += [{id: $v.id, name: $v.name, tags: $v.tags, reason: "protected"}]
+              elif $is_untagged and ($include_untagged != "true") then
+                .kept += 1 |
+                .to_keep += [{id: $v.id, name: $v.name, tags: $v.tags, reason: "untagged-excluded"}]
+              elif (.kept + .protected) < ($min_versions | tonumber) then
+                .kept += 1 |
+                .to_keep += [{id: $v.id, name: $v.name, tags: $v.tags, reason: "min-versions"}]
+              elif $is_old | not then
+                .kept += 1 |
+                .to_keep += [{id: $v.id, name: $v.name, tags: $v.tags, reason: "not-old-enough"}]
+              else
+                .to_delete += [{id: $v.id, name: $v.name, tags: $v.tags, created_at: $v.created_at}]
+              end
+            )
+          ')
+
+          # Extract counts and lists
+          KEPT_COUNT=$(echo "$RESULTS" | jq '.kept')
+          PROTECTED_COUNT=$(echo "$RESULTS" | jq '.protected')
+          TO_DELETE=$(echo "$RESULTS" | jq '.to_delete')
+          TO_DELETE_COUNT=$(echo "$TO_DELETE" | jq 'length')
+          TO_KEEP=$(echo "$RESULTS" | jq '.to_keep')
+
+          echo "=== Versions to Keep ==="
+          echo "$TO_KEEP" | jq -r '.[] | "  \(.name) [\(.tags | join(", ") | if . == "" then "<untagged>" else . end)] - \(.reason)"'
+          echo
+
+          if [ "$TO_DELETE_COUNT" -eq 0 ]; then
+            echo "=== No versions eligible for deletion ==="
+            echo "deleted-count=0" >> $GITHUB_OUTPUT
+            echo "kept-count=$((KEPT_COUNT + PROTECTED_COUNT))" >> $GITHUB_OUTPUT
+            echo "dry-run-would-delete=0" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          echo "=== Versions to Delete ($TO_DELETE_COUNT) ==="
+          echo "$TO_DELETE" | jq -r '.[] | "  \(.name) [\(.tags | join(", ") | if . == "" then "<untagged>" else . end)] created \(.created_at)"'
+          echo
+
+          DELETED=0
+          FAILED=0
+
+          if [ "$DRY_RUN" = "true" ]; then
+            echo "=== DRY RUN - No versions will be deleted ==="
+            echo "deleted-count=0" >> $GITHUB_OUTPUT
+            echo "kept-count=$((KEPT_COUNT + PROTECTED_COUNT))" >> $GITHUB_OUTPUT
+            echo "dry-run-would-delete=$TO_DELETE_COUNT" >> $GITHUB_OUTPUT
+          else
+            echo "=== Deleting versions ==="
+            for id in $(echo "$TO_DELETE" | jq -r '.[].id'); do
+              VERSION_NAME=$(echo "$TO_DELETE" | jq -r ".[] | select(.id == $id) | .name")
+              printf "Deleting version %s (id: %s)... " "$VERSION_NAME" "$id"
+              if gh api --method DELETE "$API_PATH/$id" 2>/dev/null; then
+                echo "OK"
+                DELETED=$((DELETED + 1))
+              else
+                echo "FAILED"
+                FAILED=$((FAILED + 1))
+              fi
+            done
+
+            echo
+            echo "=== Summary ==="
+            echo "Protected: $PROTECTED_COUNT"
+            echo "Kept: $KEPT_COUNT"
+            echo "Deleted: $DELETED"
+            if [ "$FAILED" -gt 0 ]; then
+              echo "Failed to delete: $FAILED"
+            fi
+
+            echo "deleted-count=$DELETED" >> $GITHUB_OUTPUT
+            echo "kept-count=$((KEPT_COUNT + PROTECTED_COUNT + FAILED))" >> $GITHUB_OUTPUT
+            echo "dry-run-would-delete=0" >> $GITHUB_OUTPUT
+          fi
