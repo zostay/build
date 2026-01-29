@@ -1,0 +1,91 @@
+name: Update Build Number
+
+# Lightweight CD workflow that only updates the build number in object store.
+# Use this for projects that handle their own builds but need to record
+# the build number for centralized deployment via genifest.
+#
+# Example:
+#   jobs:
+#     record-build:
+#       uses: zostay/build/.github/workflows/update-build-number.yaml@master
+#       with:
+#         app-name: 'myapp'
+#         aws-region: ${{ vars.AWS_DEFAULT_REGION }}
+#         aws-endpoint-url: ${{ vars.AWS_ENDPOINT_URL }}
+#         bucket: ${{ vars.BUILD_NUMBER_BUCKET }}
+#       secrets: inherit
+
+on:
+  workflow_call:
+    inputs:
+      app-name:
+        description: 'Application name for build number (required)'
+        required: true
+        type: string
+      image-name:
+        description: 'Image name for build number'
+        required: false
+        type: string
+        default: 'main'
+      env-name:
+        description: 'Environment name for build number'
+        required: false
+        type: string
+        default: 'prod'
+      aws-region:
+        description: 'AWS region for S3-compatible object store'
+        required: true
+        type: string
+      aws-endpoint-url:
+        description: 'AWS endpoint URL for S3-compatible object store'
+        required: true
+        type: string
+      bucket:
+        description: 'S3 bucket name for build number storage'
+        required: false
+        type: string
+        default: 'qubling-cloud-production'
+    secrets:
+      AWS_ACCESS_KEY_ID:
+        description: 'AWS access key ID for S3-compatible object store'
+        required: true
+      AWS_SECRET_ACCESS_KEY:
+        description: 'AWS secret access key for S3-compatible object store'
+        required: true
+    outputs:
+      build-number:
+        description: 'The build number that was recorded'
+        value: ${{ jobs.update.outputs.build-number }}
+
+jobs:
+  update:
+    name: Update Build Number
+    runs-on: ubuntu-latest
+    outputs:
+      build-number: ${{ steps.update.outputs.build-number }}
+    steps:
+      - name: Update Build Number
+        id: update
+        env:
+          APP_NAME: ${{ inputs.app-name }}
+          IMAGE_NAME: ${{ inputs.image-name }}
+          ENV_NAME: ${{ inputs.env-name }}
+          BUILD_NUMBER: ${{ github.run_number }}.${{ github.run_attempt }}
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION: ${{ inputs.aws-region }}
+          AWS_ENDPOINT_URL: ${{ inputs.aws-endpoint-url }}
+          BUILD_NUMBER_BUCKET: ${{ inputs.bucket }}
+        run: |
+          set -euo pipefail
+
+          printf 'Setting build number for %s/%s/%s to %s\n' "$APP_NAME" "$IMAGE_NAME" "$ENV_NAME" "$BUILD_NUMBER"
+
+          # Download the set-build-number script
+          curl -fsSL https://raw.githubusercontent.com/zostay/build/master/scripts/set-build-number -o set-build-number
+          chmod +x set-build-number
+
+          ./set-build-number "$APP_NAME" "$BUILD_NUMBER" --image-name "$IMAGE_NAME" --env-name "$ENV_NAME"
+
+          echo "build-number=$BUILD_NUMBER" >> $GITHUB_OUTPUT
+          echo "Successfully recorded build number: $BUILD_NUMBER"
