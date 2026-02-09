@@ -403,6 +403,7 @@ jobs:
           else
             echo "=== Deleting versions ==="
             DELETED_VERSIONS=""
+            DELETE_COUNT=0
 
             for id in $(echo "$TO_DELETE" | jq -r '.[].id'); do
               VERSION_INFO=$(echo "$TO_DELETE" | jq -r ".[] | select(.id == $id)")
@@ -412,7 +413,32 @@ jobs:
               VERSION_GROUP=$(echo "$VERSION_INFO" | jq -r '.group')
 
               printf "Deleting version %s (id: %s)... " "$VERSION_NAME" "$id"
-              if gh api --method DELETE "$API_PATH/$id" 2>/dev/null; then
+
+              # Retry logic for rate limiting
+              MAX_RETRIES=3
+              RETRY_DELAY=5
+              SUCCESS=false
+
+              for attempt in $(seq 1 $MAX_RETRIES); do
+                RESPONSE=$(gh api --method DELETE "$API_PATH/$id" 2>&1) && {
+                  SUCCESS=true
+                  break
+                }
+
+                # Check if rate limited
+                if echo "$RESPONSE" | grep -q "429\|throttled"; then
+                  if [ "$attempt" -lt "$MAX_RETRIES" ]; then
+                    echo "rate limited, waiting ${RETRY_DELAY}s (attempt $attempt/$MAX_RETRIES)..."
+                    sleep $RETRY_DELAY
+                    RETRY_DELAY=$((RETRY_DELAY * 2))  # Exponential backoff
+                  fi
+                else
+                  # Not a rate limit error, don't retry
+                  break
+                fi
+              done
+
+              if [ "$SUCCESS" = true ]; then
                 echo "OK"
                 DELETED=$((DELETED + 1))
                 printf -v ROW '| %s | %s | %s | %s |\n' "$VERSION_NAME" "$VERSION_TAGS" "$VERSION_CREATED" "$VERSION_GROUP"
@@ -422,6 +448,13 @@ jobs:
                 FAILED=$((FAILED + 1))
                 printf -v ROW '| %s | %s | %s | %s |\n' "$VERSION_NAME" "$VERSION_TAGS" "$VERSION_CREATED" "$VERSION_GROUP"
                 FAILED_VERSIONS="${FAILED_VERSIONS}${ROW}"
+              fi
+
+              # Rate limit prevention: pause every 10 deletions
+              DELETE_COUNT=$((DELETE_COUNT + 1))
+              if [ $((DELETE_COUNT % 10)) -eq 0 ]; then
+                echo "  (pausing 2s to avoid rate limits...)"
+                sleep 2
               fi
             done
 
@@ -465,7 +498,9 @@ jobs:
             if [ "$FAILED" -gt 0 ]; then
               echo "### ⚠️ Workflow completed with errors" >> "$SUMMARY_FILE"
               echo "" >> "$SUMMARY_FILE"
-              echo "Failed to delete $FAILED version(s). This may indicate permission issues." >> "$SUMMARY_FILE"
+              echo "Failed to delete $FAILED version(s). This may indicate rate limiting or permission issues." >> "$SUMMARY_FILE"
+              echo "" >> "$SUMMARY_FILE"
+              echo "**Tip:** If rate limited, re-run the workflow to continue cleanup. Successfully deleted versions won't be attempted again." >> "$SUMMARY_FILE"
               cat "$SUMMARY_FILE" >> "$GITHUB_STEP_SUMMARY"
               exit 1
             fi
