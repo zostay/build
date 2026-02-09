@@ -415,13 +415,13 @@ jobs:
               if gh api --method DELETE "$API_PATH/$id" 2>/dev/null; then
                 echo "OK"
                 DELETED=$((DELETED + 1))
-                DELETED_VERSIONS="${DELETED_VERSIONS}| ${VERSION_NAME} | ${VERSION_TAGS} | ${VERSION_CREATED} | ${VERSION_GROUP} |
-"
+                printf -v ROW '| %s | %s | %s | %s |\n' "$VERSION_NAME" "$VERSION_TAGS" "$VERSION_CREATED" "$VERSION_GROUP"
+                DELETED_VERSIONS="${DELETED_VERSIONS}${ROW}"
               else
                 echo "FAILED"
                 FAILED=$((FAILED + 1))
-                FAILED_VERSIONS="${FAILED_VERSIONS}| ${VERSION_NAME} | ${VERSION_TAGS} | ${VERSION_CREATED} | ${VERSION_GROUP} |
-"
+                printf -v ROW '| %s | %s | %s | %s |\n' "$VERSION_NAME" "$VERSION_TAGS" "$VERSION_CREATED" "$VERSION_GROUP"
+                FAILED_VERSIONS="${FAILED_VERSIONS}${ROW}"
               fi
             done
 
