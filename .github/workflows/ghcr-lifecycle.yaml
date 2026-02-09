@@ -39,7 +39,7 @@ on:
   workflow_call:
     inputs:
       package-name:
-        description: 'Name of the container package to manage'
+        description: 'Name of the container package to manage (e.g., "myapp" or "repo/myapp")'
         required: true
         type: string
       package-owner:
@@ -116,6 +116,13 @@ jobs:
         run: |
           set -euo pipefail
 
+          # Initialize summary file
+          SUMMARY_FILE=$(mktemp)
+          trap 'rm -f "$SUMMARY_FILE"' EXIT
+
+          # URL-encode the package name (handle slashes in names like "repo/image")
+          PACKAGE_NAME_ENCODED=$(printf '%s' "$PACKAGE_NAME" | jq -sRr @uri)
+
           echo "=== GHCR Lifecycle Management ==="
           echo "Package: $PACKAGE_OWNER/$PACKAGE_NAME"
           echo "Min versions to keep: $MIN_VERSIONS"
@@ -126,43 +133,91 @@ jobs:
           echo "Protected tags: $PROTECTED_TAGS"
           echo
 
+          # Start building summary
+          {
+            echo "## GHCR Lifecycle: $PACKAGE_OWNER/$PACKAGE_NAME"
+            echo ""
+            echo "| Setting | Value |"
+            echo "|---------|-------|"
+            echo "| Min versions to keep | $MIN_VERSIONS |"
+            echo "| Delete after (days) | $DELETE_AFTER_DAYS |"
+            echo "| Tag prefixes | ${TAG_PREFIXES:-*(global policy)*} |"
+            echo "| Dry run | $DRY_RUN |"
+            echo "| Include untagged | $INCLUDE_UNTAGGED |"
+            echo "| Protected tags | $PROTECTED_TAGS |"
+            echo ""
+          } >> "$SUMMARY_FILE"
+
           # Calculate cutoff timestamp (seconds since epoch)
           CUTOFF_EPOCH=$(date -u -d "$DELETE_AFTER_DAYS days ago" +%s)
           CUTOFF_DATE=$(date -u -d "@$CUTOFF_EPOCH" +%Y-%m-%dT%H:%M:%SZ)
           echo "Cutoff date: $CUTOFF_DATE"
-          echo
+          echo ""
 
           # Determine if owner is a user or org
           OWNER_TYPE=$(gh api "users/$PACKAGE_OWNER" --jq '.type' 2>/dev/null || echo "Organization")
 
           if [ "$OWNER_TYPE" = "User" ]; then
-            API_PATH="users/$PACKAGE_OWNER/packages/container/$PACKAGE_NAME/versions"
+            API_PATH="users/$PACKAGE_OWNER/packages/container/$PACKAGE_NAME_ENCODED/versions"
           else
-            API_PATH="orgs/$PACKAGE_OWNER/packages/container/$PACKAGE_NAME/versions"
+            API_PATH="orgs/$PACKAGE_OWNER/packages/container/$PACKAGE_NAME_ENCODED/versions"
           fi
 
           echo "Owner type: $OWNER_TYPE"
           echo "Using API path: $API_PATH"
-          echo
+          echo ""
 
-          # Fetch all versions (paginated) and sort by creation date (newest first)
+          # Fetch all versions (paginated)
+          # Note: --paginate with --jq processes each page separately, so we need to
+          # collect all pages first, then combine and process them
           echo "Fetching package versions..."
-          VERSIONS_JSON=$(gh api --paginate "$API_PATH" \
-            --jq '[.[] | {id: .id, name: .name, created_at: .created_at, tags: (.metadata.container.tags // [])}] | sort_by(.created_at) | reverse' \
-            2>/dev/null || echo "[]")
+          RAW_VERSIONS=$(gh api --paginate "$API_PATH" 2>&1) || {
+            echo "Error: Failed to fetch package versions"
+            echo "$RAW_VERSIONS"
+            echo ""
+            echo "### ❌ Error" >> "$SUMMARY_FILE"
+            echo "" >> "$SUMMARY_FILE"
+            echo "Failed to fetch package versions from API." >> "$SUMMARY_FILE"
+            echo "" >> "$SUMMARY_FILE"
+            echo '```' >> "$SUMMARY_FILE"
+            echo "$RAW_VERSIONS" >> "$SUMMARY_FILE"
+            echo '```' >> "$SUMMARY_FILE"
+            cat "$SUMMARY_FILE" >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          }
+
+          # Combine paginated results (each page is a JSON array) and extract needed fields
+          VERSIONS_JSON=$(echo "$RAW_VERSIONS" | jq -s '
+            [.[][] | {id: .id, name: .name, created_at: .created_at, tags: (.metadata.container.tags // [])}]
+            | sort_by(.created_at) | reverse
+          ') || {
+            echo "Error: Failed to parse package versions"
+            echo "Raw response:"
+            echo "$RAW_VERSIONS"
+            echo ""
+            echo "### ❌ Error" >> "$SUMMARY_FILE"
+            echo "" >> "$SUMMARY_FILE"
+            echo "Failed to parse package versions JSON." >> "$SUMMARY_FILE"
+            cat "$SUMMARY_FILE" >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          }
 
           TOTAL_VERSIONS=$(echo "$VERSIONS_JSON" | jq 'length')
 
           if [ "$TOTAL_VERSIONS" -eq 0 ]; then
             echo "No versions found for package $PACKAGE_NAME"
-            echo "deleted-count=0" >> $GITHUB_OUTPUT
-            echo "kept-count=0" >> $GITHUB_OUTPUT
-            echo "dry-run-would-delete=0" >> $GITHUB_OUTPUT
+            echo "deleted-count=0" >> "$GITHUB_OUTPUT"
+            echo "kept-count=0" >> "$GITHUB_OUTPUT"
+            echo "dry-run-would-delete=0" >> "$GITHUB_OUTPUT"
+            echo "### ℹ️ No versions found" >> "$SUMMARY_FILE"
+            echo "" >> "$SUMMARY_FILE"
+            echo "No container versions found for this package." >> "$SUMMARY_FILE"
+            cat "$SUMMARY_FILE" >> "$GITHUB_STEP_SUMMARY"
             exit 0
           fi
 
           echo "Total versions found: $TOTAL_VERSIONS"
-          echo
+          echo ""
 
           # Build protected tag regex from glob patterns
           build_regex() {
@@ -182,7 +237,7 @@ jobs:
           PROTECTED_REGEX=$(build_regex "$PROTECTED_TAGS")
           if [ -n "$PROTECTED_REGEX" ]; then
             echo "Protected tag regex: ^($PROTECTED_REGEX)$"
-            echo
+            echo ""
           fi
 
           # Build tag prefixes JSON array
@@ -193,14 +248,14 @@ jobs:
               echo "\"$prefix\""
             done | paste -sd ',' - | sed 's/^/[/; s/$/]/')
             echo "Tag prefix groups: $TAG_PREFIXES_JSON"
-            echo
+            echo ""
           else
             TAG_PREFIXES_JSON="[]"
           fi
 
           # Process versions using jq to handle the logic
           # When tag-prefixes is set, each prefix group gets its own min-versions quota
-          RESULTS=$(echo "$VERSIONS_JSON" | jq -r --arg cutoff "$CUTOFF_EPOCH" \
+          RESULTS=$(echo "$VERSIONS_JSON" | jq --arg cutoff "$CUTOFF_EPOCH" \
             --arg min_versions "$MIN_VERSIONS" \
             --arg include_untagged "$INCLUDE_UNTAGGED" \
             --arg protected_regex "$PROTECTED_REGEX" \
@@ -257,7 +312,14 @@ jobs:
             ) |
             # Add total kept count
             .kept = ([.kept_counts[]] | add)
-          ')
+          ') || {
+            echo "Error: Failed to process versions"
+            echo "### ❌ Error" >> "$SUMMARY_FILE"
+            echo "" >> "$SUMMARY_FILE"
+            echo "Failed to process package versions." >> "$SUMMARY_FILE"
+            cat "$SUMMARY_FILE" >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          }
 
           # Extract counts and lists
           KEPT_COUNT=$(echo "$RESULTS" | jq '.kept')
@@ -271,48 +333,99 @@ jobs:
           if [ -n "$TAG_PREFIXES" ]; then
             echo "=== Per-Group Version Counts ==="
             echo "$KEPT_COUNTS" | jq -r 'to_entries[] | "  \(.key): \(.value) kept"'
-            echo
+            echo ""
+
+            {
+              echo "### Per-Group Counts"
+              echo ""
+              echo "| Group | Kept |"
+              echo "|-------|------|"
+              echo "$KEPT_COUNTS" | jq -r 'to_entries[] | "| \(.key) | \(.value) |"'
+              echo ""
+            } >> "$SUMMARY_FILE"
           fi
 
-          echo "=== Versions to Keep ==="
+          echo "=== Versions to Keep ($((KEPT_COUNT + PROTECTED_COUNT))) ==="
           echo "$TO_KEEP" | jq -r '.[] | "  \(.name) [\(.tags | join(", ") | if . == "" then "<untagged>" else . end)] - \(.reason)"'
-          echo
+          echo ""
+
+          # Add kept versions to summary
+          {
+            echo "### ✅ Versions Kept ($((KEPT_COUNT + PROTECTED_COUNT)))"
+            echo ""
+            if [ "$((KEPT_COUNT + PROTECTED_COUNT))" -gt 0 ]; then
+              echo "| Version | Tags | Reason |"
+              echo "|---------|------|--------|"
+              echo "$TO_KEEP" | jq -r '.[] | "| \(.name) | \(.tags | join(", ") | if . == "" then "*untagged*" else . end) | \(.reason) |"'
+            else
+              echo "*No versions kept*"
+            fi
+            echo ""
+          } >> "$SUMMARY_FILE"
 
           if [ "$TO_DELETE_COUNT" -eq 0 ]; then
             echo "=== No versions eligible for deletion ==="
-            echo "deleted-count=0" >> $GITHUB_OUTPUT
-            echo "kept-count=$((KEPT_COUNT + PROTECTED_COUNT))" >> $GITHUB_OUTPUT
-            echo "dry-run-would-delete=0" >> $GITHUB_OUTPUT
+            echo "deleted-count=0" >> "$GITHUB_OUTPUT"
+            echo "kept-count=$((KEPT_COUNT + PROTECTED_COUNT))" >> "$GITHUB_OUTPUT"
+            echo "dry-run-would-delete=0" >> "$GITHUB_OUTPUT"
+
+            {
+              echo "### 🗑️ Versions Deleted (0)"
+              echo ""
+              echo "*No versions eligible for deletion*"
+            } >> "$SUMMARY_FILE"
+
+            cat "$SUMMARY_FILE" >> "$GITHUB_STEP_SUMMARY"
             exit 0
           fi
 
           echo "=== Versions to Delete ($TO_DELETE_COUNT) ==="
           echo "$TO_DELETE" | jq -r '.[] | "  \(.name) [\(.tags | join(", ") | if . == "" then "<untagged>" else . end)] created \(.created_at) (group: \(.group))"'
-          echo
+          echo ""
 
           DELETED=0
           FAILED=0
+          FAILED_VERSIONS=""
 
           if [ "$DRY_RUN" = "true" ]; then
             echo "=== DRY RUN - No versions will be deleted ==="
-            echo "deleted-count=0" >> $GITHUB_OUTPUT
-            echo "kept-count=$((KEPT_COUNT + PROTECTED_COUNT))" >> $GITHUB_OUTPUT
-            echo "dry-run-would-delete=$TO_DELETE_COUNT" >> $GITHUB_OUTPUT
+            echo "deleted-count=0" >> "$GITHUB_OUTPUT"
+            echo "kept-count=$((KEPT_COUNT + PROTECTED_COUNT))" >> "$GITHUB_OUTPUT"
+            echo "dry-run-would-delete=$TO_DELETE_COUNT" >> "$GITHUB_OUTPUT"
+
+            {
+              echo "### 🔍 Versions That Would Be Deleted ($TO_DELETE_COUNT) - DRY RUN"
+              echo ""
+              echo "| Version | Tags | Created | Group |"
+              echo "|---------|------|---------|-------|"
+              echo "$TO_DELETE" | jq -r '.[] | "| \(.name) | \(.tags | join(", ") | if . == "" then "*untagged*" else . end) | \(.created_at) | \(.group) |"'
+            } >> "$SUMMARY_FILE"
           else
             echo "=== Deleting versions ==="
+            DELETED_VERSIONS=""
+
             for id in $(echo "$TO_DELETE" | jq -r '.[].id'); do
-              VERSION_NAME=$(echo "$TO_DELETE" | jq -r ".[] | select(.id == $id) | .name")
+              VERSION_INFO=$(echo "$TO_DELETE" | jq -r ".[] | select(.id == $id)")
+              VERSION_NAME=$(echo "$VERSION_INFO" | jq -r '.name')
+              VERSION_TAGS=$(echo "$VERSION_INFO" | jq -r '.tags | join(", ") | if . == "" then "*untagged*" else . end')
+              VERSION_CREATED=$(echo "$VERSION_INFO" | jq -r '.created_at')
+              VERSION_GROUP=$(echo "$VERSION_INFO" | jq -r '.group')
+
               printf "Deleting version %s (id: %s)... " "$VERSION_NAME" "$id"
               if gh api --method DELETE "$API_PATH/$id" 2>/dev/null; then
                 echo "OK"
                 DELETED=$((DELETED + 1))
+                DELETED_VERSIONS="${DELETED_VERSIONS}| ${VERSION_NAME} | ${VERSION_TAGS} | ${VERSION_CREATED} | ${VERSION_GROUP} |
+"
               else
                 echo "FAILED"
                 FAILED=$((FAILED + 1))
+                FAILED_VERSIONS="${FAILED_VERSIONS}| ${VERSION_NAME} | ${VERSION_TAGS} | ${VERSION_CREATED} | ${VERSION_GROUP} |
+"
               fi
             done
 
-            echo
+            echo ""
             echo "=== Summary ==="
             echo "Protected: $PROTECTED_COUNT"
             echo "Kept: $KEPT_COUNT"
@@ -321,7 +434,41 @@ jobs:
               echo "Failed to delete: $FAILED"
             fi
 
-            echo "deleted-count=$DELETED" >> $GITHUB_OUTPUT
-            echo "kept-count=$((KEPT_COUNT + PROTECTED_COUNT + FAILED))" >> $GITHUB_OUTPUT
-            echo "dry-run-would-delete=0" >> $GITHUB_OUTPUT
+            echo "deleted-count=$DELETED" >> "$GITHUB_OUTPUT"
+            echo "kept-count=$((KEPT_COUNT + PROTECTED_COUNT + FAILED))" >> "$GITHUB_OUTPUT"
+            echo "dry-run-would-delete=0" >> "$GITHUB_OUTPUT"
+
+            # Add deleted versions to summary
+            {
+              echo "### 🗑️ Versions Deleted ($DELETED)"
+              echo ""
+              if [ "$DELETED" -gt 0 ]; then
+                echo "| Version | Tags | Created | Group |"
+                echo "|---------|------|---------|-------|"
+                printf '%s' "$DELETED_VERSIONS"
+              else
+                echo "*No versions were deleted*"
+              fi
+              echo ""
+
+              if [ "$FAILED" -gt 0 ]; then
+                echo "### ⚠️ Failed to Delete ($FAILED)"
+                echo ""
+                echo "| Version | Tags | Created | Group |"
+                echo "|---------|------|---------|-------|"
+                printf '%s' "$FAILED_VERSIONS"
+                echo ""
+              fi
+            } >> "$SUMMARY_FILE"
+
+            # Fail the workflow if any deletions failed
+            if [ "$FAILED" -gt 0 ]; then
+              echo "### ⚠️ Workflow completed with errors" >> "$SUMMARY_FILE"
+              echo "" >> "$SUMMARY_FILE"
+              echo "Failed to delete $FAILED version(s). This may indicate permission issues." >> "$SUMMARY_FILE"
+              cat "$SUMMARY_FILE" >> "$GITHUB_STEP_SUMMARY"
+              exit 1
+            fi
           fi
+
+          cat "$SUMMARY_FILE" >> "$GITHUB_STEP_SUMMARY"
