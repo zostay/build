@@ -331,6 +331,250 @@ When enabled, the workflow:
    ```
 4. This build number can then be retrieved by other systems or workflows to coordinate deployments
 
+### Update Build Number (`update-build-number.yaml`)
+
+A lightweight workflow that only updates the build number in object storage without running genifest. Use this for projects that handle their own builds but need to record the build number for centralized deployment.
+
+#### Usage
+
+```yaml
+name: Record Build Number
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  record-build:
+    uses: zostay/build/.github/workflows/update-build-number.yaml@master
+    with:
+      app-name: 'myapp'
+      aws-region: ${{ vars.AWS_DEFAULT_REGION }}
+      aws-endpoint-url: ${{ vars.AWS_ENDPOINT_URL }}
+      bucket: ${{ vars.BUILD_NUMBER_BUCKET }}
+    secrets: inherit
+```
+
+#### Inputs
+
+| Input | Description | Required | Default |
+|-------|-------------|----------|---------|
+| `app-name` | Application name for build number | Yes | - |
+| `image-name` | Image name for build number | No | `main` |
+| `env-name` | Environment name for build number | No | `prod` |
+| `aws-region` | AWS region for S3-compatible object store | Yes | - |
+| `aws-endpoint-url` | AWS endpoint URL for S3-compatible object store | Yes | - |
+| `bucket` | S3 bucket name for build number storage | No | `qubling-cloud-production` |
+
+#### Secrets
+
+| Secret | Description | Required |
+|--------|-------------|----------|
+| `AWS_ACCESS_KEY_ID` | AWS access key ID | Yes |
+| `AWS_SECRET_ACCESS_KEY` | AWS secret access key | Yes |
+
+#### Outputs
+
+| Output | Description |
+|--------|-------------|
+| `build-number` | The build number that was recorded (e.g., `14.1`) |
+
+#### When to Use
+
+Use this workflow instead of the full CD workflow when:
+- Your project builds container images but doesn't manage its own Kubernetes manifests
+- You want to delegate manifest generation to a centralized deployment repository
+- You need to record build numbers for coordination with other systems
+- You want minimal overhead and fast execution
+
+---
+
+### GHCR Lifecycle Management (`ghcr-lifecycle.yaml`)
+
+Manages container image lifecycle in GitHub Container Registry (ghcr.io). Similar to AWS ECR lifecycle policies, this workflow prunes old images while keeping a minimum number of recent versions.
+
+#### Features
+
+- **Minimum Version Retention**: Always keeps at least N versions regardless of age
+- **Age-Based Pruning**: Only deletes versions older than `delete-after-days`
+- **Per-Environment Lifecycle**: Apply retention policies independently per tag prefix (e.g., `prod-*` and `stg-*` each keep their own N versions)
+- **Protected Tags**: Glob patterns to protect specific tags from deletion (e.g., `latest`, `v*`, `prod-*`)
+- **Untagged Cleanup**: Option to include or exclude untagged images
+- **Dry-Run Mode**: Preview what would be deleted without actually deleting
+- **User/Org Support**: Automatically detects whether the package owner is a user or organization
+
+#### Usage
+
+```yaml
+name: Cleanup Container Images
+on:
+  schedule:
+    - cron: '0 0 * * 0'  # Weekly on Sunday at midnight
+  workflow_dispatch:      # Allow manual runs
+
+jobs:
+  cleanup:
+    uses: zostay/build/.github/workflows/ghcr-lifecycle.yaml@master
+    with:
+      package-name: 'myapp'
+      min-versions-to-keep: 10
+      delete-after-days: 30
+      protected-tags: 'latest,v*,prod-*'
+    secrets:
+      GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+```
+
+#### Inputs
+
+| Input | Description | Required | Default |
+|-------|-------------|----------|---------|
+| `package-name` | Name of the container package to manage | Yes | - |
+| `package-owner` | Owner of the package (user or org) | No | Repository owner |
+| `min-versions-to-keep` | Minimum number of versions to keep regardless of age (per prefix group if `tag-prefixes` is set) | No | `10` |
+| `delete-after-days` | Versions older than this many days are eligible for deletion | No | `30` |
+| `tag-prefixes` | Comma-separated list of tag prefixes to manage independently (e.g., `prod-,stg-`) | No | `''` |
+| `dry-run` | If true, only report what would be deleted | No | `false` |
+| `include-untagged` | If true, include untagged versions in cleanup | No | `true` |
+| `protected-tags` | Comma-separated list of tag patterns to never delete | No | `latest` |
+
+#### Secrets
+
+| Secret | Description | Required |
+|--------|-------------|----------|
+| `GHCR_TOKEN` | GitHub token with `read:packages` and `delete:packages` permissions | Yes |
+
+**Note:** You can use `${{ secrets.GITHUB_TOKEN }}` if the workflow has `packages: write` permission, or create a Personal Access Token (PAT) with the required scopes.
+
+#### Outputs
+
+| Output | Description |
+|--------|-------------|
+| `deleted-count` | Number of versions deleted |
+| `kept-count` | Number of versions kept |
+| `dry-run-would-delete` | Number of versions that would be deleted (dry-run only) |
+
+#### Protected Tag Patterns
+
+The `protected-tags` input accepts glob-style patterns:
+
+| Pattern | Matches |
+|---------|---------|
+| `latest` | Exactly `latest` |
+| `v*` | Any tag starting with `v` (e.g., `v1.0.0`, `v2.3.4`) |
+| `prod-*` | Any tag starting with `prod-` (e.g., `prod-main`, `prod-hotfix`) |
+| `*-stable` | Any tag ending with `-stable` |
+
+Multiple patterns can be combined with commas: `latest,v*,prod-*,*-stable`
+
+#### Deletion Logic
+
+Versions are evaluated in order from newest to oldest:
+
+1. **Protected tags**: Never deleted, regardless of age or count
+2. **Minimum count**: The first N versions are always kept (where N = `min-versions-to-keep`)
+3. **Age check**: Remaining versions are only deleted if older than `delete-after-days`
+4. **Untagged handling**: Untagged versions follow the same rules if `include-untagged: true`
+
+#### Per-Environment Lifecycle with Tag Prefixes
+
+A common pattern is to tag container images by environment, such as `prod-29.1` for production and `stg-28.1` for staging. When cleaning up images, you typically want to apply retention policies **independently** for each environment - keeping 10 production versions shouldn't count against your staging quota and vice versa.
+
+The `tag-prefixes` input enables this by grouping versions by their tag prefix and applying `min-versions-to-keep` separately to each group.
+
+**Example: Independent retention for prod and staging environments**
+
+```yaml
+name: Cleanup Container Images
+on:
+  schedule:
+    - cron: '0 0 * * 0'  # Weekly
+  workflow_dispatch:
+
+jobs:
+  cleanup:
+    uses: zostay/build/.github/workflows/ghcr-lifecycle.yaml@master
+    with:
+      package-name: 'myapp'
+      tag-prefixes: 'prod-,stg-'
+      min-versions-to-keep: 10
+      delete-after-days: 7
+    secrets:
+      GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+```
+
+With this configuration:
+- The 10 most recent `prod-*` tagged versions are always kept
+- The 10 most recent `stg-*` tagged versions are always kept (separately)
+- Untagged versions get their own quota of 10
+- Tags that don't match any prefix (e.g., `latest`, `v1.0.0`) go into an "other" group with its own quota
+- After the minimum count is satisfied for each group, versions older than 7 days are eligible for deletion
+
+**How versions are grouped:**
+
+| Tag | Group |
+|-----|-------|
+| `prod-29.1` | `prod-` |
+| `prod-28.1` | `prod-` |
+| `stg-15.2` | `stg-` |
+| `stg-14.1` | `stg-` |
+| `latest` | `other` |
+| `v1.0.0` | `other` |
+| *(no tag)* | `untagged` |
+
+**Example: Three environments with different prefixes**
+
+```yaml
+jobs:
+  cleanup:
+    uses: zostay/build/.github/workflows/ghcr-lifecycle.yaml@master
+    with:
+      package-name: 'myapp'
+      tag-prefixes: 'prod-,stg-,dev-'
+      min-versions-to-keep: 5
+      delete-after-days: 14
+      protected-tags: 'latest'
+    secrets:
+      GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+```
+
+This keeps 5 versions each for `prod-*`, `stg-*`, and `dev-*` independently, plus protects `latest` from ever being deleted.
+
+#### Example: Conservative Cleanup
+
+Keep more versions and only delete very old images:
+
+```yaml
+jobs:
+  cleanup:
+    uses: zostay/build/.github/workflows/ghcr-lifecycle.yaml@master
+    with:
+      package-name: 'myapp'
+      min-versions-to-keep: 25
+      delete-after-days: 90
+      protected-tags: 'latest,v*,release-*'
+    secrets:
+      GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+```
+
+#### Example: Aggressive Cleanup with Dry-Run
+
+Preview aggressive cleanup before actually deleting:
+
+```yaml
+jobs:
+  cleanup:
+    uses: zostay/build/.github/workflows/ghcr-lifecycle.yaml@master
+    with:
+      package-name: 'myapp'
+      min-versions-to-keep: 5
+      delete-after-days: 7
+      dry-run: true
+    secrets:
+      GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+```
+
+---
+
 ## Requirements
 
 Your repository should have a `genifest.yaml` configuration file. See the [genifest documentation](https://github.com/zostay/genifest) for configuration details.

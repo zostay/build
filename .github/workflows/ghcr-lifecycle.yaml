@@ -16,7 +16,19 @@ name: GHCR Lifecycle Management
 #       with:
 #         package-name: 'myapp'
 #         min-versions-to-keep: 10
-#         max-age-days: 30
+#         delete-after-days: 30
+#       secrets:
+#         GHCR_TOKEN: ${{ secrets.GHCR_TOKEN }}
+#
+# Example (per-environment lifecycle with tag prefixes):
+#   jobs:
+#     cleanup:
+#       uses: zostay/build/.github/workflows/ghcr-lifecycle.yaml@master
+#       with:
+#         package-name: 'myapp'
+#         tag-prefixes: 'prod-,stg-'
+#         min-versions-to-keep: 10
+#         delete-after-days: 7
 #       secrets:
 #         GHCR_TOKEN: ${{ secrets.GHCR_TOKEN }}
 #
@@ -36,15 +48,20 @@ on:
         type: string
         default: ''
       min-versions-to-keep:
-        description: 'Minimum number of versions to keep regardless of age'
+        description: 'Minimum number of versions to keep regardless of age (per tag prefix group if tag-prefixes is set)'
         required: false
         type: number
         default: 10
-      max-age-days:
-        description: 'Maximum age in days before a version is eligible for deletion'
+      delete-after-days:
+        description: 'Versions older than this many days are eligible for deletion (after min-versions-to-keep is satisfied)'
         required: false
         type: number
         default: 30
+      tag-prefixes:
+        description: 'Comma-separated list of tag prefixes to manage independently (e.g., "prod-,stg-"). Each prefix group gets its own min-versions-to-keep quota.'
+        required: false
+        type: string
+        default: ''
       dry-run:
         description: 'If true, only report what would be deleted without actually deleting'
         required: false
@@ -91,7 +108,8 @@ jobs:
           PACKAGE_NAME: ${{ inputs.package-name }}
           PACKAGE_OWNER: ${{ inputs.package-owner || github.repository_owner }}
           MIN_VERSIONS: ${{ inputs.min-versions-to-keep }}
-          MAX_AGE_DAYS: ${{ inputs.max-age-days }}
+          DELETE_AFTER_DAYS: ${{ inputs.delete-after-days }}
+          TAG_PREFIXES: ${{ inputs.tag-prefixes }}
           DRY_RUN: ${{ inputs.dry-run }}
           INCLUDE_UNTAGGED: ${{ inputs.include-untagged }}
           PROTECTED_TAGS: ${{ inputs.protected-tags }}
@@ -101,14 +119,15 @@ jobs:
           echo "=== GHCR Lifecycle Management ==="
           echo "Package: $PACKAGE_OWNER/$PACKAGE_NAME"
           echo "Min versions to keep: $MIN_VERSIONS"
-          echo "Max age (days): $MAX_AGE_DAYS"
+          echo "Delete after (days): $DELETE_AFTER_DAYS"
+          echo "Tag prefixes: ${TAG_PREFIXES:-<none - global policy>}"
           echo "Dry run: $DRY_RUN"
           echo "Include untagged: $INCLUDE_UNTAGGED"
           echo "Protected tags: $PROTECTED_TAGS"
           echo
 
           # Calculate cutoff timestamp (seconds since epoch)
-          CUTOFF_EPOCH=$(date -u -d "$MAX_AGE_DAYS days ago" +%s)
+          CUTOFF_EPOCH=$(date -u -d "$DELETE_AFTER_DAYS days ago" +%s)
           CUTOFF_DATE=$(date -u -d "@$CUTOFF_EPOCH" +%Y-%m-%dT%H:%M:%SZ)
           echo "Cutoff date: $CUTOFF_DATE"
           echo
@@ -166,12 +185,26 @@ jobs:
             echo
           fi
 
+          # Build tag prefixes JSON array
+          if [ -n "$TAG_PREFIXES" ]; then
+            TAG_PREFIXES_JSON=$(echo "$TAG_PREFIXES" | tr ',' '\n' | while read -r prefix; do
+              prefix=$(echo "$prefix" | xargs)  # trim whitespace
+              [ -z "$prefix" ] && continue
+              echo "\"$prefix\""
+            done | paste -sd ',' - | sed 's/^/[/; s/$/]/')
+            echo "Tag prefix groups: $TAG_PREFIXES_JSON"
+            echo
+          else
+            TAG_PREFIXES_JSON="[]"
+          fi
+
           # Process versions using jq to handle the logic
-          # This avoids subshell issues with while loops
+          # When tag-prefixes is set, each prefix group gets its own min-versions quota
           RESULTS=$(echo "$VERSIONS_JSON" | jq -r --arg cutoff "$CUTOFF_EPOCH" \
             --arg min_versions "$MIN_VERSIONS" \
             --arg include_untagged "$INCLUDE_UNTAGGED" \
-            --arg protected_regex "$PROTECTED_REGEX" '
+            --arg protected_regex "$PROTECTED_REGEX" \
+            --argjson tag_prefixes "$TAG_PREFIXES_JSON" '
             def is_protected($tags; $regex):
               if $regex == "" then false
               elif ($tags | length) == 0 then false
@@ -181,38 +214,65 @@ jobs:
             def is_old($created_at; $cutoff):
               ($created_at | sub("\\.[0-9]+Z$"; "Z") | fromdateiso8601) < ($cutoff | tonumber);
 
+            # Find which prefix group a version belongs to (based on its tags)
+            # Returns the first matching prefix, or "untagged" for untagged, or "other" for no match
+            def get_prefix_group($tags; $prefixes):
+              if ($tags | length) == 0 then "untagged"
+              elif ($prefixes | length) == 0 then "all"
+              else
+                ($prefixes | map(. as $p | if ($tags | any(startswith($p))) then $p else null end) | map(select(. != null)) | first) // "other"
+              end;
+
+            # Initialize counters per prefix group
+            (if ($tag_prefixes | length) > 0 then
+              ($tag_prefixes + ["untagged", "other"]) | map({key: ., value: 0}) | from_entries
+            else
+              {"all": 0}
+            end) as $initial_counts |
+
             reduce .[] as $v (
-              {kept: 0, protected: 0, to_delete: [], to_keep: []};
+              {kept_counts: $initial_counts, protected: 0, to_delete: [], to_keep: []};
 
               ($v.tags | length) as $tag_count |
               ($tag_count == 0) as $is_untagged |
               is_protected($v.tags; $protected_regex) as $is_protected |
               is_old($v.created_at; $cutoff) as $is_old |
+              get_prefix_group($v.tags; $tag_prefixes) as $prefix_group |
 
               if $is_protected then
                 .protected += 1 |
-                .to_keep += [{id: $v.id, name: $v.name, tags: $v.tags, reason: "protected"}]
+                .to_keep += [{id: $v.id, name: $v.name, tags: $v.tags, reason: "protected", group: $prefix_group}]
               elif $is_untagged and ($include_untagged != "true") then
-                .kept += 1 |
-                .to_keep += [{id: $v.id, name: $v.name, tags: $v.tags, reason: "untagged-excluded"}]
-              elif (.kept + .protected) < ($min_versions | tonumber) then
-                .kept += 1 |
-                .to_keep += [{id: $v.id, name: $v.name, tags: $v.tags, reason: "min-versions"}]
+                .kept_counts[$prefix_group] += 1 |
+                .to_keep += [{id: $v.id, name: $v.name, tags: $v.tags, reason: "untagged-excluded", group: $prefix_group}]
+              elif .kept_counts[$prefix_group] < ($min_versions | tonumber) then
+                .kept_counts[$prefix_group] += 1 |
+                .to_keep += [{id: $v.id, name: $v.name, tags: $v.tags, reason: ("min-versions (" + $prefix_group + ": " + ((.kept_counts[$prefix_group]) | tostring) + "/" + $min_versions + ")"), group: $prefix_group}]
               elif $is_old | not then
-                .kept += 1 |
-                .to_keep += [{id: $v.id, name: $v.name, tags: $v.tags, reason: "not-old-enough"}]
+                .kept_counts[$prefix_group] += 1 |
+                .to_keep += [{id: $v.id, name: $v.name, tags: $v.tags, reason: "not-old-enough", group: $prefix_group}]
               else
-                .to_delete += [{id: $v.id, name: $v.name, tags: $v.tags, created_at: $v.created_at}]
+                .to_delete += [{id: $v.id, name: $v.name, tags: $v.tags, created_at: $v.created_at, group: $prefix_group}]
               end
-            )
+            ) |
+            # Add total kept count
+            .kept = ([.kept_counts[]] | add)
           ')
 
           # Extract counts and lists
           KEPT_COUNT=$(echo "$RESULTS" | jq '.kept')
           PROTECTED_COUNT=$(echo "$RESULTS" | jq '.protected')
+          KEPT_COUNTS=$(echo "$RESULTS" | jq '.kept_counts')
           TO_DELETE=$(echo "$RESULTS" | jq '.to_delete')
           TO_DELETE_COUNT=$(echo "$TO_DELETE" | jq 'length')
           TO_KEEP=$(echo "$RESULTS" | jq '.to_keep')
+
+          # Show per-group counts if using tag prefixes
+          if [ -n "$TAG_PREFIXES" ]; then
+            echo "=== Per-Group Version Counts ==="
+            echo "$KEPT_COUNTS" | jq -r 'to_entries[] | "  \(.key): \(.value) kept"'
+            echo
+          fi
 
           echo "=== Versions to Keep ==="
           echo "$TO_KEEP" | jq -r '.[] | "  \(.name) [\(.tags | join(", ") | if . == "" then "<untagged>" else . end)] - \(.reason)"'
@@ -227,7 +287,7 @@ jobs:
           fi
 
           echo "=== Versions to Delete ($TO_DELETE_COUNT) ==="
-          echo "$TO_DELETE" | jq -r '.[] | "  \(.name) [\(.tags | join(", ") | if . == "" then "<untagged>" else . end)] created \(.created_at)"'
+          echo "$TO_DELETE" | jq -r '.[] | "  \(.name) [\(.tags | join(", ") | if . == "" then "<untagged>" else . end)] created \(.created_at) (group: \(.group))"'
           echo
 
           DELETED=0
