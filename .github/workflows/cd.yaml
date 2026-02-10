@@ -467,7 +467,7 @@ jobs:
               echo
               echo "**Custom Environment Variables:**"
               echo '```bash'
-              echo "${{ inputs.environment-variables }}" | jq -r 'to_entries[] | "\(.key)=\(.value)"' | sort
+              echo '${{ inputs.environment-variables }}' | jq -r 'to_entries[] | "\(.key)=\(.value)"' | sort
               echo '```'
               echo
             fi
