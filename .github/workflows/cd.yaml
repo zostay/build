@@ -224,6 +224,13 @@ jobs:
           echo "branch-name=$BRANCH_NAME" >> $GITHUB_OUTPUT
           echo "build-tag=$BUILD_TAG" >> $GITHUB_OUTPUT
 
+          # NOTE: This deliberately scrams merge conflicts. The deployment
+          # branch is built from the source branch and then has changes made
+          # to it via genifest to create the deployment files that ArgoCD
+          # will use. These changes should arbitrarily succeed. If they don't
+          # then the deployment will fail and ArgoCD should be told to revert
+          # the deployment.
+
           # Check if the deploy-* branch exists
           if git ls-remote --exit-code --heads origin "$DEPLOY_TARGET" > /dev/null 2>&1; then
             echo "Deploy branch $DEPLOY_TARGET exists, updating it with latest changes from $BASE_BRANCH"
