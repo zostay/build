@@ -467,7 +467,7 @@ jobs:
             echo "**Genifest Group:** $GENIFEST_GROUP"
             echo "**Timestamp:** $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
             echo
-            echo "## Environment Variables"
+            echo "<details><summary>Environment Variables</summary>"
             echo
             if [ "${{ steps.set-env-vars.outputs.custom-vars-count }}" -gt 0 ]; then
               echo "**Custom variables set:** ${{ steps.set-env-vars.outputs.custom-vars-count }}"
@@ -478,7 +478,7 @@ jobs:
               echo '```'
               echo
             fi
-            echo "<details><summary>All Environment Variables</summary>"
+            echo "**All Environment Variables:**"
             echo
             echo '```bash'
             env | sort
@@ -486,17 +486,21 @@ jobs:
             echo
             echo "</details>"
             echo
-            echo "## Genifest Version"
+            echo "<details><summary>Genifest Version</summary>"
             echo
             echo '```'
             genifest version
             echo '```'
             echo
-            echo "## Genifest Configuration"
+            echo "</details>"
+            echo
+            echo "<details><summary>Genifest Configuration</summary>"
             echo
             echo '```yaml'
             genifest config
             echo '```'
+            echo
+            echo "</details>"
             echo
             echo "## Genifest Output"
             echo
