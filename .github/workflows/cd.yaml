@@ -175,7 +175,7 @@ jobs:
       pr-url: ${{ steps.create-pr.outputs.pr-url }}
     steps:
       - name: Checkout Repository
-        uses: actions/checkout@v5
+        uses: actions/checkout@v6
         with:
           fetch-depth: 0
           token: ${{ github.token }}
