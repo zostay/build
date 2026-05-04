@@ -238,13 +238,10 @@ jobs:
             git fetch origin "$DEPLOY_TARGET:$DEPLOY_TARGET"
             # Create new deployment branch from current HEAD (which has latest changes)
             git checkout -b "$BRANCH_NAME"
-            # Merge any deployment-specific changes from the existing deploy branch
-            # This allows for deployment-only files that aren't in the source branch
-            git merge "$DEPLOY_TARGET" --no-edit || {
-              echo "Merge conflict detected. Deploy branch may need manual resolution."
-              git merge --abort
-              echo "Proceeding with deployment branch from current HEAD only"
-            }
+            # Record the existing deploy branch as a parent so the eventual PR
+            # merges cleanly, but keep the tree entirely from current HEAD.
+            # Manifests are always full replacements — latest always wins.
+            git merge -s ours "$DEPLOY_TARGET" --no-edit
           else
             echo "Deploy branch $DEPLOY_TARGET does not exist, branching from current HEAD"
             git checkout -b "$BRANCH_NAME"
