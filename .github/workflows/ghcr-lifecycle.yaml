@@ -330,7 +330,6 @@ jobs:
           INITIAL_TO_KEEP=$(echo "$RESULTS" | jq '.to_keep')
           REGISTRY_OWNER=$(printf '%s' "$PACKAGE_OWNER" | tr '[:upper:]' '[:lower:]')
           REGISTRY_NAME=$(printf '%s' "$PACKAGE_NAME" | tr '[:upper:]' '[:lower:]')
-          REGISTRY_TOKEN=$(printf '%s' "$GH_TOKEN" | base64 | tr -d '\n')
           REGISTRY_ACCEPT="application/vnd.oci.image.index.v1+json,application/vnd.docker.distribution.manifest.list.v2+json,application/vnd.oci.image.manifest.v1+json,application/vnd.docker.distribution.manifest.v2+json"
 
           echo "Scanning kept manifests for child digest references..."
@@ -342,11 +341,11 @@ jobs:
               *) continue ;;
             esac
             MANIFEST=$(curl -sf \
-                            -H "Authorization: Bearer $REGISTRY_TOKEN" \
+                            -H "Authorization: Bearer $GH_TOKEN" \
                             -H "Accept: $REGISTRY_ACCEPT" \
                             "https://ghcr.io/v2/$REGISTRY_OWNER/$REGISTRY_NAME/manifests/$digest" 2>/dev/null) || continue
             printf '%s' "$MANIFEST" | jq -r '.manifests[]?.digest // empty' 2>/dev/null >> "$REFERENCED_DIGESTS_FILE" || true
-          done < <(printf '%s' "$INITIAL_TO_KEEP" | jq -r '.[].name')
+          done < <(printf '%s' "$INITIAL_TO_KEEP" | jq -r '.[] | select(.tags | length > 0) | .name')
 
           REFERENCED_COUNT=0
           if [ -s "$REFERENCED_DIGESTS_FILE" ]; then
@@ -359,7 +358,8 @@ jobs:
               (.to_delete | map(select($ref_set[.name] == true) | . + {reason: "referenced-by-kept-manifest"})) as $rescued |
               .to_delete = (.to_delete | map(select($ref_set[.name] != true))) |
               .to_keep += $rescued |
-              .kept += ($rescued | length)
+              reduce $rescued[] as $r (.; .kept_counts[$r.group] = ((.kept_counts[$r.group] // 0) + 1)) |
+              .kept = ([.kept_counts[]] | add)
             ')
           else
             echo "No referenced child digests found"
