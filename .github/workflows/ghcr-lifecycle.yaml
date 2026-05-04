@@ -118,7 +118,8 @@ jobs:
 
           # Initialize summary file
           SUMMARY_FILE=$(mktemp)
-          trap 'rm -f "$SUMMARY_FILE"' EXIT
+          REFERENCED_DIGESTS_FILE=$(mktemp)
+          trap 'rm -f "$SUMMARY_FILE" "$REFERENCED_DIGESTS_FILE"' EXIT
 
           # URL-encode the package name (handle slashes in names like "repo/image")
           PACKAGE_NAME_ENCODED=$(printf '%s' "$PACKAGE_NAME" | jq -sRr @uri)
@@ -320,6 +321,50 @@ jobs:
             cat "$SUMMARY_FILE" >> "$GITHUB_STEP_SUMMARY"
             exit 1
           }
+
+          # Multi-arch images appear as a manifest list (carrying the tag) plus
+          # one untagged per-platform manifest per architecture. The per-platform
+          # manifests are only referenced by digest from the manifest list, so
+          # deleting them as "untagged" would break the kept tagged version.
+          # Fetch each kept manifest from the registry and rescue any children.
+          INITIAL_TO_KEEP=$(echo "$RESULTS" | jq '.to_keep')
+          REGISTRY_OWNER=$(printf '%s' "$PACKAGE_OWNER" | tr '[:upper:]' '[:lower:]')
+          REGISTRY_NAME=$(printf '%s' "$PACKAGE_NAME" | tr '[:upper:]' '[:lower:]')
+          REGISTRY_ACCEPT="application/vnd.oci.image.index.v1+json,application/vnd.docker.distribution.manifest.list.v2+json,application/vnd.oci.image.manifest.v1+json,application/vnd.docker.distribution.manifest.v2+json"
+
+          echo "Scanning kept manifests for child digest references..."
+          : > "$REFERENCED_DIGESTS_FILE"
+          while IFS= read -r digest; do
+            [ -z "$digest" ] && continue
+            case "$digest" in
+              sha256:*) ;;
+              *) continue ;;
+            esac
+            MANIFEST=$(curl -sf \
+                            -H "Authorization: Bearer $GH_TOKEN" \
+                            -H "Accept: $REGISTRY_ACCEPT" \
+                            "https://ghcr.io/v2/$REGISTRY_OWNER/$REGISTRY_NAME/manifests/$digest" 2>/dev/null) || continue
+            printf '%s' "$MANIFEST" | jq -r '.manifests[]?.digest // empty' 2>/dev/null >> "$REFERENCED_DIGESTS_FILE" || true
+          done < <(printf '%s' "$INITIAL_TO_KEEP" | jq -r '.[] | select(.tags | length > 0) | .name')
+
+          REFERENCED_COUNT=0
+          if [ -s "$REFERENCED_DIGESTS_FILE" ]; then
+            REFERENCED_JSON=$(sort -u "$REFERENCED_DIGESTS_FILE" | jq -R . | jq -s .)
+            REFERENCED_COUNT=$(printf '%s' "$REFERENCED_JSON" | jq 'length')
+            echo "Found $REFERENCED_COUNT digest(s) referenced by kept manifests"
+
+            RESULTS=$(printf '%s' "$RESULTS" | jq --argjson referenced "$REFERENCED_JSON" '
+              ($referenced | map({(.): true}) | add // {}) as $ref_set |
+              (.to_delete | map(select($ref_set[.name] == true) | . + {reason: "referenced-by-kept-manifest"})) as $rescued |
+              .to_delete = (.to_delete | map(select($ref_set[.name] != true))) |
+              .to_keep += $rescued |
+              reduce $rescued[] as $r (.; .kept_counts[$r.group] = ((.kept_counts[$r.group] // 0) + 1)) |
+              .kept = ([.kept_counts[]] | add)
+            ')
+          else
+            echo "No referenced child digests found"
+          fi
+          echo ""
 
           # Extract counts and lists
           KEPT_COUNT=$(echo "$RESULTS" | jq '.kept')
