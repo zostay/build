@@ -352,48 +352,93 @@ jobs:
           REGISTRY_REPO="$REGISTRY_OWNER/$REGISTRY_NAME"
           REGISTRY_ACCEPT="application/vnd.oci.image.index.v1+json,application/vnd.docker.distribution.manifest.list.v2+json,application/vnd.oci.image.manifest.v1+json,application/vnd.docker.distribution.manifest.v2+json,application/vnd.docker.distribution.manifest.v1+prettyjws,application/json"
 
-          registry_get() {
-            curl -sf \
-                 -H "Authorization: Bearer $REGISTRY_TOKEN" \
-                 -H "Accept: $REGISTRY_ACCEPT" \
-                 "https://ghcr.io/v2/$REGISTRY_REPO/manifests/$1" 2>/dev/null
-          }
-
-          registry_exists() {
-            curl -sfI -o /dev/null \
-                 -H "Authorization: Bearer $REGISTRY_TOKEN" \
-                 -H "Accept: $REGISTRY_ACCEPT" \
-                 "https://ghcr.io/v2/$REGISTRY_REPO/manifests/$1" 2>/dev/null
-          }
+          # Bound every registry call. This step makes one request per manifest
+          # kept, plus one per referenced digest in the post-run check, and the
+          # job has no timeout of its own - so an unbounded stall would hang the
+          # run rather than fail it.
+          REGISTRY_CURL_OPTS="--connect-timeout 10 --max-time 60 --retry 3 --retry-connrefused"
+          REGISTRY_BODY="$WORK_DIR/manifest_body"
+          # registry_get is called as $(registry_get ...), so anything it sets in
+          # a variable dies with the subshell. The status has to cross in a file.
+          REGISTRY_STATUS_FILE="$WORK_DIR/last_status"
+          : > "$REGISTRY_STATUS_FILE"
+          registry_status() { cat "$REGISTRY_STATUS_FILE" 2>/dev/null || echo "000"; }
 
           registry_probe() {
-            curl -s -o /dev/null -w '%{http_code}' \
+            curl -s $REGISTRY_CURL_OPTS -o /dev/null -w '%{http_code}' \
                  -H "Authorization: Bearer $1" \
                  -H "Accept: application/json" \
                  "https://ghcr.io/v2/$REGISTRY_REPO/tags/list?n=1" 2>/dev/null
           }
 
-          # ghcr.io rejects a bare GitHub token as a bearer credential (403),
-          # so exchange it for a repository pull token. Fall back to the
-          # base64 form ghcr.io also accepts.
+          # ghcr.io rejects a bare GitHub token as a bearer credential (403), so
+          # exchange it for a repository pull token. Fall back to the base64 form
+          # ghcr.io also accepts. Non-zero if neither works.
+          registry_authenticate() {
+            local response candidate
+            REGISTRY_TOKEN=""
+            response=$(curl -sf $REGISTRY_CURL_OPTS -u "x:$GH_TOKEN" \
+              "https://ghcr.io/token?scope=repository:$REGISTRY_REPO:pull&service=ghcr.io" 2>/dev/null || true)
+            candidate=$(printf '%s' "$response" | jq -r '.token // empty' 2>/dev/null || true)
+            if [ -n "$candidate" ] && [ "$(registry_probe "$candidate")" = "200" ]; then
+              REGISTRY_TOKEN="$candidate"
+              REGISTRY_AUTH_METHOD="exchanged pull token"
+              return 0
+            fi
+            candidate=$(printf '%s' "$GH_TOKEN" | base64 | tr -d '\n')
+            if [ "$(registry_probe "$candidate")" = "200" ]; then
+              REGISTRY_TOKEN="$candidate"
+              REGISTRY_AUTH_METHOD="base64-encoded token"
+              return 0
+            fi
+            return 1
+          }
+
+          # Fetch a manifest, recording the HTTP status for registry_status and,
+          # for a GET, leaving the body in $REGISTRY_BODY. Zero only on 200.
+          #
+          # Registry pull tokens last minutes, and a run with many deletions and
+          # rate-limit backoff can outlive one. An auth or transport failure is
+          # therefore retried once against a freshly minted token: an expired
+          # token during the post-run check would otherwise be indistinguishable
+          # from a manifest that has actually gone missing, and would fail the
+          # run for damage that never happened. A 404 is a real answer about a
+          # real manifest, so it is never retried.
+          registry_fetch() {
+            local ref="$1" mode="${2:-get}" attempt code
+            for attempt in 1 2; do
+              if [ "$mode" = "head" ]; then
+                code=$(curl -s $REGISTRY_CURL_OPTS -I -o /dev/null -w '%{http_code}' \
+                            -H "Authorization: Bearer $REGISTRY_TOKEN" \
+                            -H "Accept: $REGISTRY_ACCEPT" \
+                            "https://ghcr.io/v2/$REGISTRY_REPO/manifests/$ref" 2>/dev/null) || code="000"
+              else
+                code=$(curl -s $REGISTRY_CURL_OPTS -o "$REGISTRY_BODY" -w '%{http_code}' \
+                            -H "Authorization: Bearer $REGISTRY_TOKEN" \
+                            -H "Accept: $REGISTRY_ACCEPT" \
+                            "https://ghcr.io/v2/$REGISTRY_REPO/manifests/$ref" 2>/dev/null) || code="000"
+              fi
+              printf '%s' "$code" >| "$REGISTRY_STATUS_FILE"
+              case "$code" in
+                200) return 0 ;;
+                401|403|000|5??)
+                  if [ "$attempt" -eq 1 ]; then
+                    registry_authenticate >/dev/null 2>&1 || true
+                  fi
+                  ;;
+                *) return 1 ;;
+              esac
+            done
+            return 1
+          }
+
+          registry_get() { registry_fetch "$1" get && cat "$REGISTRY_BODY"; }
+          registry_exists() { registry_fetch "$1" head; }
+
           echo "Authenticating to ghcr.io for $REGISTRY_REPO..."
           REGISTRY_TOKEN=""
           REGISTRY_AUTH_METHOD=""
-
-          TOKEN_RESPONSE=$(curl -sf -u "x:$GH_TOKEN" \
-            "https://ghcr.io/token?scope=repository:$REGISTRY_REPO:pull&service=ghcr.io" 2>/dev/null || true)
-          AUTH_CANDIDATE=$(printf '%s' "$TOKEN_RESPONSE" | jq -r '.token // empty' 2>/dev/null || true)
-          if [ -n "$AUTH_CANDIDATE" ] && [ "$(registry_probe "$AUTH_CANDIDATE")" = "200" ]; then
-            REGISTRY_TOKEN="$AUTH_CANDIDATE"
-            REGISTRY_AUTH_METHOD="exchanged pull token"
-          else
-            AUTH_CANDIDATE=$(printf '%s' "$GH_TOKEN" | base64 | tr -d '\n')
-            if [ "$(registry_probe "$AUTH_CANDIDATE")" = "200" ]; then
-              REGISTRY_TOKEN="$AUTH_CANDIDATE"
-              REGISTRY_AUTH_METHOD="base64-encoded token"
-            fi
-          fi
-          AUTH_CANDIDATE=""
+          registry_authenticate || true
 
           if [ -z "$REGISTRY_TOKEN" ]; then
             echo "Error: could not authenticate to ghcr.io for $REGISTRY_REPO."
@@ -423,11 +468,38 @@ jobs:
           PENDING_FILE="$WORK_DIR/pending"
           NEXT_FILE="$WORK_DIR/next"
           UNRESOLVED_FILE="$WORK_DIR/unresolved"
+          INFRA_FAIL_FILE="$WORK_DIR/infra_fail"
+          REF_MAP_FILE="$WORK_DIR/ref_map"
           : > "$REFERENCED_DIGESTS_FILE"
           : > "$SCANNED_FILE"
           : > "$UNRESOLVED_FILE"
+          : > "$INFRA_FAIL_FILE"
+          : > "$REF_MAP_FILE"
 
-          printf '%s' "$RESULTS" | jq -r '.to_keep[].name | select(startswith("sha256:"))' > "$PENDING_FILE"
+          # Every GHCR container version is named by its digest, and this walk
+          # rests on that. If one is not, skipping it would be precisely the
+          # silent gap this step exists to close, so treat it as fatal instead.
+          NON_DIGEST_KEPT=$(printf '%s' "$RESULTS" | jq -r '.to_keep[].name | select(startswith("sha256:") | not)')
+          if [ -n "$NON_DIGEST_KEPT" ]; then
+            echo "Error: kept version(s) are not named by digest, so their references cannot be resolved:"
+            printf '%s\n' "$NON_DIGEST_KEPT" | sed 's/^/  /'
+            {
+              echo "### ❌ Unexpected version naming"
+              echo ""
+              echo "Some versions this run would keep are not named by a \`sha256:\` digest, so"
+              echo "the manifests they reference cannot be resolved."
+              echo ""
+              echo "**Nothing was deleted.**"
+              echo ""
+              echo '```'
+              printf '%s\n' "$NON_DIGEST_KEPT"
+              echo '```'
+            } >> "$SUMMARY_FILE"
+            cat "$SUMMARY_FILE" >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+
+          printf '%s' "$RESULTS" | jq -r '.to_keep[].name' > "$PENDING_FILE"
 
           RESCUE_PASS=0
           while [ -s "$PENDING_FILE" ]; do
@@ -441,12 +513,24 @@ jobs:
               printf '%s\n' "$digest" >> "$SCANNED_FILE"
               if MANIFEST=$(registry_get "$digest"); then
                 # .manifests covers per-arch children plus attestation/SBOM
-                # entries; .subject covers referrers-style attachments.
-                printf '%s' "$MANIFEST" \
+                # entries; .subject covers referrers-style attachments. Record
+                # which parent named each child so the post-run check can say
+                # what a missing manifest belonged to.
+                while IFS= read -r child; do
+                  [ -z "$child" ] && continue
+                  printf '%s\t%s\n' "$digest" "$child" >> "$REF_MAP_FILE"
+                  printf '%s\n' "$child" >> "$NEXT_FILE"
+                done < <(printf '%s' "$MANIFEST" \
                   | jq -r '[(.manifests[]?.digest // empty), (.subject.digest // empty)] | .[]' 2>/dev/null \
-                  | grep '^sha256:' >> "$NEXT_FILE" || true
-              else
+                  | grep '^sha256:' || true)
+              elif [ "$(registry_status)" = "404" ]; then
+                # A real answer: this manifest is genuinely not in the registry.
                 printf '%s\n' "$digest" >> "$UNRESOLVED_FILE"
+              else
+                # Auth, transport or server trouble - already retried against a
+                # fresh token. We cannot tell what this manifest references, so
+                # this run must not delete anything.
+                printf '%s\t%s\n' "$digest" "$(registry_status)" >> "$INFRA_FAIL_FILE"
               fi
             done < "$PENDING_FILE"
             sort -u "$NEXT_FILE" -o "$NEXT_FILE"
@@ -456,6 +540,31 @@ jobs:
             # Already-scanned digests are skipped, so this terminates.
             cp "$NEXT_FILE" "$PENDING_FILE"
           done
+
+          if [ -s "$INFRA_FAIL_FILE" ]; then
+            INFRA_COUNT=$(grep -c . "$INFRA_FAIL_FILE" || true)
+            echo "Error: $INFRA_COUNT manifest(s) could not be read from the registry (not a 404):"
+            awk -F'\t' '{printf "  %s (HTTP %s)\n", $1, $2}' "$INFRA_FAIL_FILE"
+            echo ""
+            echo "Nothing will be deleted. The registry did not answer, so what these"
+            echo "manifests reference is unknown."
+            {
+              echo "### ❌ Registry did not answer"
+              echo ""
+              echo "$INFRA_COUNT manifest(s) could not be read from ghcr.io - an auth, transport"
+              echo "or server failure rather than a 404, already retried against a fresh token."
+              echo ""
+              echo "**Nothing was deleted.** What those manifests reference is unknown, and"
+              echo "deleting on that guess is what breaks multi-arch tags."
+              echo ""
+              echo "| Manifest | HTTP |"
+              echo "|----------|------|"
+              awk -F'\t' '{printf "| %s | %s |\n", $1, $2}' "$INFRA_FAIL_FILE"
+              echo ""
+            } >> "$SUMMARY_FILE"
+            cat "$SUMMARY_FILE" >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
 
           # An unresolvable digest that is still a live package version is a
           # survivor whose dependencies are unknown - that is the fail-closed
@@ -647,6 +756,43 @@ jobs:
               echo "$TO_DELETE" | jq -r '.[] | "| \(.name) | \(.tags | join(", ") | if . == "" then "*untagged*" else . end) | \(.created_at) | \(.group) |"'
             } >> "$SUMMARY_FILE"
           else
+            # The reference set was computed from a snapshot of the package
+            # taken before this point. If a build pushed a new image in the
+            # meantime, that image may reference a manifest already on the
+            # deletion list - unchanged layers and base images routinely produce
+            # the same child digest across builds, and GHCR stores one version
+            # for it. Deleting against a stale picture is the whole failure mode
+            # this workflow exists to avoid, so re-read the version list and
+            # stand down if anything moved. The next scheduled run picks it up.
+            echo "=== Re-checking package state before deleting ==="
+            RECHECK_RAW=$(gh api --paginate "$API_PATH" 2>/dev/null || true)
+            RECHECK_NAMES=$(printf '%s' "$RECHECK_RAW" | jq -s -r '[.[][] | .name] | sort | .[]' 2>/dev/null || true)
+            SNAPSHOT_NAMES=$(printf '%s' "$VERSIONS_JSON" | jq -r '[.[].name] | sort | .[]')
+            if [ -z "$RECHECK_NAMES" ] || [ "$RECHECK_NAMES" != "$SNAPSHOT_NAMES" ]; then
+              ADDED=$(comm -13 <(printf '%s\n' "$SNAPSHOT_NAMES") <(printf '%s\n' "$RECHECK_NAMES") | grep -c . || true)
+              echo "Package changed while this run was working ($ADDED new version(s))."
+              echo "Nothing will be deleted - a new image may reference a manifest on the"
+              echo "deletion list. Re-run once the package is settled."
+              {
+                echo "### ⚠️ Package changed mid-run - nothing deleted"
+                echo ""
+                echo "The package's version list changed after this run computed which manifests"
+                echo "are referenced ($ADDED version(s) added). A newly pushed image can reference"
+                echo "a manifest already scheduled for deletion, so deleting now would be acting"
+                echo "on a stale picture."
+                echo ""
+                echo "**Nothing was deleted.** Re-run once builds have settled."
+                echo ""
+              } >> "$SUMMARY_FILE"
+              echo "deleted-count=0" >> "$GITHUB_OUTPUT"
+              echo "kept-count=$((KEPT_COUNT + PROTECTED_COUNT))" >> "$GITHUB_OUTPUT"
+              echo "dry-run-would-delete=$TO_DELETE_COUNT" >> "$GITHUB_OUTPUT"
+              cat "$SUMMARY_FILE" >> "$GITHUB_STEP_SUMMARY"
+              exit 0
+            fi
+            echo "Unchanged; proceeding."
+            echo ""
+
             echo "=== Deleting versions ==="
             DELETED_VERSIONS=""
             DELETE_COUNT=0
@@ -708,26 +854,37 @@ jobs:
 
             # Verify the run's own work. This class of corruption is silent by
             # construction - the tag keeps resolving, only the pull fails - so
-            # nothing catches it until a deployment does. Re-resolve every
-            # surviving tag and confirm each manifest it references is still
-            # present.
-            echo "=== Verifying surviving tags ==="
+            # nothing catches it until a deployment does.
+            #
+            # Check the reference set itself rather than re-walking tags. It is
+            # the same set the rescue was computed from, so it already covers
+            # attestation and SBOM children, .subject links, and indexes that
+            # survive without a tag - none of which a tag walk would reach.
+            echo "=== Verifying manifests referenced by survivors ==="
             : >| "$WORK_DIR/broken_tags"
-            VERIFIED_TAGS=0
-            while IFS="$(printf '\t')" read -r vdigest vtags; do
-              [ -z "$vdigest" ] && continue
-              VERIFIED_TAGS=$((VERIFIED_TAGS + 1))
-              if ! VMANIFEST=$(registry_get "$vdigest"); then
-                printf '%s\t%s\t%s\n' "$vtags" "$vdigest" "index unreadable" >> "$WORK_DIR/broken_tags"
-                continue
-              fi
-              while IFS= read -r vchild; do
-                [ -z "$vchild" ] && continue
-                if ! registry_exists "$vchild"; then
-                  printf '%s\t%s\t%s\n' "$vtags" "$vdigest" "missing child $vchild" >> "$WORK_DIR/broken_tags"
-                fi
-              done < <(printf '%s' "$VMANIFEST" | jq -r '.manifests[]?.digest // empty')
-            done < <(printf '%s' "$RESULTS" | jq -r '.to_keep[] | select(.tags | length > 0) | "\(.name)\t\(.tags | join(","))"')
+
+            # digest -> the tags of the kept versions that reference it, for the
+            # report; a digest with no tagged parent still gets checked.
+            PARENT_TAGS_FILE="$WORK_DIR/parent_tags"
+            printf '%s' "$RESULTS" | jq -r '.to_keep[] | "\(.name)\t\(.tags | join(","))"' >| "$PARENT_TAGS_FILE"
+
+            VERIFIED_REFS=0
+            while IFS= read -r vchild; do
+              [ -z "$vchild" ] && continue
+              VERIFIED_REFS=$((VERIFIED_REFS + 1))
+              registry_exists "$vchild" && continue
+              # Name the surviving parents that point at it.
+              vparents=$(awk -F'\t' -v c="$vchild" '$2 == c { print $1 }' "$REF_MAP_FILE" | sort -u)
+              vtags=""
+              while IFS= read -r vp; do
+                [ -z "$vp" ] && continue
+                pt=$(awk -F'\t' -v d="$vp" '$1 == d { print $2 }' "$PARENT_TAGS_FILE")
+                [ -n "$pt" ] && vtags="${vtags:+$vtags; }$pt"
+              done <<< "$vparents"
+              printf '%s\t%s\t%s\n' "${vtags:-<untagged parent>}" \
+                "$(printf '%s' "$vparents" | tr '\n' ' ' | sed 's/ $//')" \
+                "missing $vchild (HTTP $(registry_status))" >> "$WORK_DIR/broken_tags"
+            done < "$REFERENCED_DIGESTS_FILE"
 
             # Damage this run caused is a hard failure. Damage that was
             # already there (recorded above, before anything was deleted) is
@@ -737,8 +894,10 @@ jobs:
             : >| "$WORK_DIR/broken_old"
             while IFS= read -r row; do
               [ -z "$row" ] && continue
-              rowdigest=${row##*missing child }
-              if [ "$rowdigest" != "$row" ] && grep -qxF -- "$rowdigest" "$UNRESOLVED_FILE"; then
+              rowdigest=${row##*missing }
+              rowdigest=${rowdigest%% *}
+              case "$rowdigest" in sha256:*) ;; *) rowdigest="" ;; esac
+              if [ -n "$rowdigest" ] && grep -qxF -- "$rowdigest" "$UNRESOLVED_FILE"; then
                 printf '%s\n' "$row" >> "$WORK_DIR/broken_old"
               else
                 printf '%s\n' "$row" >> "$WORK_DIR/broken_new"
@@ -747,7 +906,7 @@ jobs:
 
             BROKEN_NEW_COUNT=$(grep -c . "$WORK_DIR/broken_new" || true)
             BROKEN_OLD_COUNT=$(grep -c . "$WORK_DIR/broken_old" || true)
-            echo "Checked $VERIFIED_TAGS surviving tagged image(s): $BROKEN_NEW_COUNT new problem(s), $BROKEN_OLD_COUNT pre-existing"
+            echo "Checked $VERIFIED_REFS referenced manifest(s): $BROKEN_NEW_COUNT new problem(s), $BROKEN_OLD_COUNT pre-existing"
 
             if [ "$BROKEN_OLD_COUNT" -gt 0 ]; then
               {
