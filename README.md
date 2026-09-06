@@ -400,6 +400,7 @@ Manages container image lifecycle in GitHub Container Registry (ghcr.io). Simila
 - **Per-Environment Lifecycle**: Apply retention policies independently per tag prefix (e.g., `prod-*` and `stg-*` each keep their own N versions)
 - **Protected Tags**: Glob patterns to protect specific tags from deletion (e.g., `latest`, `v*`, `prod-*`)
 - **Untagged Cleanup**: Option to include or exclude untagged images
+- **Multi-Arch Safe**: Never deletes a manifest that a retained image references, so multi-arch tags stay pullable
 - **Dry-Run Mode**: Preview what would be deleted without actually deleting
 - **User/Org Support**: Automatically detects whether the package owner is a user or organization
 
@@ -474,6 +475,34 @@ Versions are evaluated in order from newest to oldest:
 2. **Minimum count**: The first N versions are always kept (where N = `min-versions-to-keep`)
 3. **Age check**: Remaining versions are only deleted if older than `delete-after-days`
 4. **Untagged handling**: Untagged versions follow the same rules if `include-untagged: true`
+5. **Referenced manifests**: Anything still referenced by a retained image is put back, overriding steps 2-4
+
+#### Multi-Arch Images
+
+A multi-arch image is not one version. It is an *index* that carries the tag plus one
+untagged per-architecture child manifest, and buildx adds attestation and SBOM manifests
+the same way. GHCR lists every one of them as a package version, and the children carry
+no tags.
+
+That makes them look deletable to any policy that reasons about tags and ages alone. They
+are not: deleting a child while keeping its index leaves a tag that still resolves and can
+never be pulled again, failing with `NotFound` at deploy time. The manifests cannot be
+recovered - only rebuilding and re-pushing restores such a tag.
+
+So after the retention maths above, the workflow resolves every version it intends to keep
+against the registry, collects the digests those manifests reference, and removes them from
+the deletion list. It repeats until the set stops growing, since a referenced manifest can
+reference others in turn.
+
+This step is **fail-closed**. If the registry cannot be reached, or a manifest the run means
+to keep cannot be read back, the workflow deletes nothing and fails. An unpruned package
+costs storage; a missing child manifest costs an outage.
+
+After deleting, the workflow re-resolves every surviving tag and checks that each manifest
+it references is still present. Damage this run caused fails the workflow. Damage that was
+already there is reported as a warning, since only a rebuild can repair it.
+
+This requires `GHCR_TOKEN` to carry `read:packages` in addition to `delete:packages`.
 
 #### Per-Environment Lifecycle with Tag Prefixes
 
