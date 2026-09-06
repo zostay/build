@@ -118,8 +118,9 @@ jobs:
 
           # Initialize summary file
           SUMMARY_FILE=$(mktemp)
-          REFERENCED_DIGESTS_FILE=$(mktemp)
-          trap 'rm -f "$SUMMARY_FILE" "$REFERENCED_DIGESTS_FILE"' EXIT
+          WORK_DIR=$(mktemp -d)
+          REFERENCED_DIGESTS_FILE="$WORK_DIR/referenced"
+          trap 'rm -f "$SUMMARY_FILE"; rm -rf "$WORK_DIR"' EXIT
 
           # URL-encode the package name (handle slashes in names like "repo/image")
           PACKAGE_NAME_ENCODED=$(printf '%s' "$PACKAGE_NAME" | jq -sRr @uri)
@@ -322,36 +323,190 @@ jobs:
             exit 1
           }
 
-          # Multi-arch images appear as a manifest list (carrying the tag) plus
-          # one untagged per-platform manifest per architecture. The per-platform
-          # manifests are only referenced by digest from the manifest list, so
-          # deleting them as "untagged" would break the kept tagged version.
-          # Fetch each kept manifest from the registry and rescue any children.
-          INITIAL_TO_KEEP=$(echo "$RESULTS" | jq '.to_keep')
+          # ---------------------------------------------------------------
+          # Protect every manifest that a surviving version depends on.
+          #
+          # A multi-arch image is an index that carries the tag and refers to
+          # untagged per-platform child manifests by digest; buildx
+          # attestation and SBOM manifests hang off the same index as
+          # "unknown/unknown" entries. GHCR lists every one of them as a
+          # package "version", and the children carry no tags, so the
+          # retention maths above sees them as ordinary untagged versions and
+          # will happily delete a child while keeping the index that points
+          # at it. The tag still resolves afterwards; every pull of it fails
+          # with NotFound.
+          #
+          # So, after all quota maths and overriding it unconditionally:
+          # resolve every version this run intends to keep, collect the
+          # digests it references, and pull those back out of the deletion
+          # list. Repeat until the set stops growing, because a rescued
+          # manifest can reference further manifests of its own.
+          #
+          # This step is fail-closed. If a kept manifest cannot be resolved
+          # then what it depends on is unknown, and deleting on that guess is
+          # exactly what hollowed out the registry before. Abort instead: an
+          # unpruned package costs storage, a missing child costs an outage.
+          # ---------------------------------------------------------------
           REGISTRY_OWNER=$(printf '%s' "$PACKAGE_OWNER" | tr '[:upper:]' '[:lower:]')
           REGISTRY_NAME=$(printf '%s' "$PACKAGE_NAME" | tr '[:upper:]' '[:lower:]')
-          REGISTRY_ACCEPT="application/vnd.oci.image.index.v1+json,application/vnd.docker.distribution.manifest.list.v2+json,application/vnd.oci.image.manifest.v1+json,application/vnd.docker.distribution.manifest.v2+json"
+          REGISTRY_REPO="$REGISTRY_OWNER/$REGISTRY_NAME"
+          REGISTRY_ACCEPT="application/vnd.oci.image.index.v1+json,application/vnd.docker.distribution.manifest.list.v2+json,application/vnd.oci.image.manifest.v1+json,application/vnd.docker.distribution.manifest.v2+json,application/vnd.docker.distribution.manifest.v1+prettyjws,application/json"
 
-          echo "Scanning kept manifests for child digest references..."
+          registry_get() {
+            curl -sf \
+                 -H "Authorization: Bearer $REGISTRY_TOKEN" \
+                 -H "Accept: $REGISTRY_ACCEPT" \
+                 "https://ghcr.io/v2/$REGISTRY_REPO/manifests/$1" 2>/dev/null
+          }
+
+          registry_exists() {
+            curl -sfI -o /dev/null \
+                 -H "Authorization: Bearer $REGISTRY_TOKEN" \
+                 -H "Accept: $REGISTRY_ACCEPT" \
+                 "https://ghcr.io/v2/$REGISTRY_REPO/manifests/$1" 2>/dev/null
+          }
+
+          registry_probe() {
+            curl -s -o /dev/null -w '%{http_code}' \
+                 -H "Authorization: Bearer $1" \
+                 -H "Accept: application/json" \
+                 "https://ghcr.io/v2/$REGISTRY_REPO/tags/list?n=1" 2>/dev/null
+          }
+
+          # ghcr.io rejects a bare GitHub token as a bearer credential (403),
+          # so exchange it for a repository pull token. Fall back to the
+          # base64 form ghcr.io also accepts.
+          echo "Authenticating to ghcr.io for $REGISTRY_REPO..."
+          REGISTRY_TOKEN=""
+          REGISTRY_AUTH_METHOD=""
+
+          TOKEN_RESPONSE=$(curl -sf -u "x:$GH_TOKEN" \
+            "https://ghcr.io/token?scope=repository:$REGISTRY_REPO:pull&service=ghcr.io" 2>/dev/null || true)
+          AUTH_CANDIDATE=$(printf '%s' "$TOKEN_RESPONSE" | jq -r '.token // empty' 2>/dev/null || true)
+          if [ -n "$AUTH_CANDIDATE" ] && [ "$(registry_probe "$AUTH_CANDIDATE")" = "200" ]; then
+            REGISTRY_TOKEN="$AUTH_CANDIDATE"
+            REGISTRY_AUTH_METHOD="exchanged pull token"
+          else
+            AUTH_CANDIDATE=$(printf '%s' "$GH_TOKEN" | base64 | tr -d '\n')
+            if [ "$(registry_probe "$AUTH_CANDIDATE")" = "200" ]; then
+              REGISTRY_TOKEN="$AUTH_CANDIDATE"
+              REGISTRY_AUTH_METHOD="base64-encoded token"
+            fi
+          fi
+          AUTH_CANDIDATE=""
+
+          if [ -z "$REGISTRY_TOKEN" ]; then
+            echo "Error: could not authenticate to ghcr.io for $REGISTRY_REPO."
+            echo "Nothing will be deleted. Without registry access this run cannot"
+            echo "tell which untagged versions are per-architecture manifests that"
+            echo "kept tags depend on."
+            {
+              echo "### ❌ Registry authentication failed"
+              echo ""
+              echo "Could not read manifests for \`$REGISTRY_REPO\` from ghcr.io, so the set"
+              echo "of manifests referenced by kept images could not be determined."
+              echo ""
+              echo "**Nothing was deleted.** Pruning without that information is how multi-arch"
+              echo "tags get hollowed out: the tag survives, its per-architecture children do"
+              echo "not, and every pull afterwards fails with \`NotFound\`."
+              echo ""
+              echo "Check that \`GHCR_TOKEN\` carries \`read:packages\` for this package."
+            } >> "$SUMMARY_FILE"
+            cat "$SUMMARY_FILE" >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+          echo "Registry auth: $REGISTRY_AUTH_METHOD"
+          echo ""
+
+          echo "Resolving manifests referenced by kept versions..."
+          SCANNED_FILE="$WORK_DIR/scanned"
+          PENDING_FILE="$WORK_DIR/pending"
+          NEXT_FILE="$WORK_DIR/next"
+          UNRESOLVED_FILE="$WORK_DIR/unresolved"
           : > "$REFERENCED_DIGESTS_FILE"
-          while IFS= read -r digest; do
-            [ -z "$digest" ] && continue
-            case "$digest" in
-              sha256:*) ;;
-              *) continue ;;
-            esac
-            MANIFEST=$(curl -sf \
-                            -H "Authorization: Bearer $GH_TOKEN" \
-                            -H "Accept: $REGISTRY_ACCEPT" \
-                            "https://ghcr.io/v2/$REGISTRY_OWNER/$REGISTRY_NAME/manifests/$digest" 2>/dev/null) || continue
-            printf '%s' "$MANIFEST" | jq -r '.manifests[]?.digest // empty' 2>/dev/null >> "$REFERENCED_DIGESTS_FILE" || true
-          done < <(printf '%s' "$INITIAL_TO_KEEP" | jq -r '.[] | select(.tags | length > 0) | .name')
+          : > "$SCANNED_FILE"
+          : > "$UNRESOLVED_FILE"
+
+          printf '%s' "$RESULTS" | jq -r '.to_keep[].name | select(startswith("sha256:"))' > "$PENDING_FILE"
+
+          RESCUE_PASS=0
+          while [ -s "$PENDING_FILE" ]; do
+            RESCUE_PASS=$((RESCUE_PASS + 1))
+            : > "$NEXT_FILE"
+            while IFS= read -r digest; do
+              [ -z "$digest" ] && continue
+              if grep -qxF -- "$digest" "$SCANNED_FILE"; then
+                continue
+              fi
+              printf '%s\n' "$digest" >> "$SCANNED_FILE"
+              if MANIFEST=$(registry_get "$digest"); then
+                # .manifests covers per-arch children plus attestation/SBOM
+                # entries; .subject covers referrers-style attachments.
+                printf '%s' "$MANIFEST" \
+                  | jq -r '[(.manifests[]?.digest // empty), (.subject.digest // empty)] | .[]' 2>/dev/null \
+                  | grep '^sha256:' >> "$NEXT_FILE" || true
+              else
+                printf '%s\n' "$digest" >> "$UNRESOLVED_FILE"
+              fi
+            done < "$PENDING_FILE"
+            sort -u "$NEXT_FILE" -o "$NEXT_FILE"
+            cat "$NEXT_FILE" >> "$REFERENCED_DIGESTS_FILE"
+            # A referenced manifest may itself be an index, and anything
+            # rescued below becomes a survivor whose own references matter.
+            # Already-scanned digests are skipped, so this terminates.
+            cp "$NEXT_FILE" "$PENDING_FILE"
+          done
+
+          # An unresolvable digest that is still a live package version is a
+          # survivor whose dependencies are unknown - that is the fail-closed
+          # case. An unresolvable digest that is no longer a version at all is
+          # a dangling reference: damage a previous run already did, which is
+          # reported below but cannot be made worse by this one.
+          BLOCKING_UNRESOLVED=""
+          DANGLING_REFS=""
+          if [ -s "$UNRESOLVED_FILE" ]; then
+            sort -u "$UNRESOLVED_FILE" -o "$UNRESOLVED_FILE"
+            BLOCKING_UNRESOLVED=$(printf '%s' "$VERSIONS_JSON" | jq -r --rawfile unresolved "$UNRESOLVED_FILE" '
+              ($unresolved | split("\n") | map(select(. != "")) | map({(.): true}) | add // {}) as $u |
+              [.[] | select($u[.name] == true) | .name] | .[]
+            ')
+            DANGLING_REFS=$(printf '%s' "$VERSIONS_JSON" | jq -r --rawfile unresolved "$UNRESOLVED_FILE" '
+              ([.[] | .name] | map({(.): true}) | add // {}) as $known |
+              ($unresolved | split("\n") | map(select(. != ""))) | map(select($known[.] != true)) | .[]
+            ')
+          fi
+
+          if [ -n "$BLOCKING_UNRESOLVED" ]; then
+            BLOCKING_COUNT=$(printf '%s\n' "$BLOCKING_UNRESOLVED" | grep -c . || true)
+            echo "Error: $BLOCKING_COUNT kept version(s) could not be resolved from the registry:"
+            printf '%s\n' "$BLOCKING_UNRESOLVED" | sed 's/^/  /'
+            echo ""
+            echo "Nothing will be deleted. These versions survive this run, so anything"
+            echo "they reference must survive too - and that reference set is unknown."
+            {
+              echo "### ❌ Kept manifests could not be resolved"
+              echo ""
+              echo "$BLOCKING_COUNT version(s) that this run would keep could not be read back"
+              echo "from ghcr.io, so the manifests they depend on are unknown."
+              echo ""
+              echo "**Nothing was deleted.** Deleting an unknown dependency is what breaks"
+              echo "multi-arch tags."
+              echo ""
+              echo '```'
+              printf '%s\n' "$BLOCKING_UNRESOLVED"
+              echo '```'
+            } >> "$SUMMARY_FILE"
+            cat "$SUMMARY_FILE" >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
 
           REFERENCED_COUNT=0
+          RESCUED_COUNT=0
           if [ -s "$REFERENCED_DIGESTS_FILE" ]; then
-            REFERENCED_JSON=$(sort -u "$REFERENCED_DIGESTS_FILE" | jq -R . | jq -s .)
+            sort -u "$REFERENCED_DIGESTS_FILE" -o "$REFERENCED_DIGESTS_FILE"
+            REFERENCED_JSON=$(jq -R . < "$REFERENCED_DIGESTS_FILE" | jq -s .)
             REFERENCED_COUNT=$(printf '%s' "$REFERENCED_JSON" | jq 'length')
-            echo "Found $REFERENCED_COUNT digest(s) referenced by kept manifests"
+            echo "Kept versions reference $REFERENCED_COUNT manifest(s) (resolved in $RESCUE_PASS pass(es))"
 
             RESULTS=$(printf '%s' "$RESULTS" | jq --argjson referenced "$REFERENCED_JSON" '
               ($referenced | map({(.): true}) | add // {}) as $ref_set |
@@ -359,10 +514,56 @@ jobs:
               .to_delete = (.to_delete | map(select($ref_set[.name] != true))) |
               .to_keep += $rescued |
               reduce $rescued[] as $r (.; .kept_counts[$r.group] = ((.kept_counts[$r.group] // 0) + 1)) |
-              .kept = ([.kept_counts[]] | add)
+              .kept = ([.kept_counts[]] | add) |
+              .rescued = ($rescued | length)
             ')
+            RESCUED_COUNT=$(printf '%s' "$RESULTS" | jq '.rescued')
+            echo "Rescued $RESCUED_COUNT version(s) from deletion as referenced children"
           else
-            echo "No referenced child digests found"
+            REFERENCED_JSON='[]'
+            echo "No kept version references another manifest"
+          fi
+
+          # Belt and braces: the deletion list must not intersect the
+          # referenced set. The rescue above already guarantees this; the
+          # assertion is here so that a future edit which breaks it fails the
+          # run instead of quietly hollowing out the registry again.
+          LEAKED=$(printf '%s' "$RESULTS" | jq -r --argjson referenced "$REFERENCED_JSON" '
+            ($referenced | map({(.): true}) | add // {}) as $ref_set |
+            [.to_delete[] | select($ref_set[.name] == true) | .name] | .[]
+          ')
+          if [ -n "$LEAKED" ]; then
+            echo "Error: deletion list still contains manifests referenced by kept images:"
+            printf '%s\n' "$LEAKED" | sed 's/^/  /'
+            {
+              echo "### ❌ Internal check failed"
+              echo ""
+              echo "The deletion list still contained manifests referenced by kept images."
+              echo "**Nothing was deleted.** This is a bug in the lifecycle workflow."
+            } >> "$SUMMARY_FILE"
+            cat "$SUMMARY_FILE" >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+
+          if [ -n "$DANGLING_REFS" ]; then
+            DANGLING_COUNT=$(printf '%s\n' "$DANGLING_REFS" | grep -c . || true)
+            echo "Warning: $DANGLING_COUNT manifest(s) referenced by kept images are already"
+            echo "missing from the registry. Tags depending on them resolve but cannot be"
+            echo "pulled, and only a rebuild restores them."
+            printf '%s\n' "$DANGLING_REFS" | sed 's/^/  /'
+            echo ""
+            {
+              echo "### ⚠️ Pre-existing broken references ($DANGLING_COUNT)"
+              echo ""
+              echo "Manifests referenced by kept images are already gone from the registry."
+              echo "Tags depending on them still resolve but cannot be pulled. This damage"
+              echo "predates this run and only a rebuild and re-push restores those tags."
+              echo ""
+              echo '```'
+              printf '%s\n' "$DANGLING_REFS"
+              echo '```'
+              echo ""
+            } >> "$SUMMARY_FILE"
           fi
           echo ""
 
@@ -504,6 +705,84 @@ jobs:
             done
 
             echo ""
+
+            # Verify the run's own work. This class of corruption is silent by
+            # construction - the tag keeps resolving, only the pull fails - so
+            # nothing catches it until a deployment does. Re-resolve every
+            # surviving tag and confirm each manifest it references is still
+            # present.
+            echo "=== Verifying surviving tags ==="
+            : >| "$WORK_DIR/broken_tags"
+            VERIFIED_TAGS=0
+            while IFS="$(printf '\t')" read -r vdigest vtags; do
+              [ -z "$vdigest" ] && continue
+              VERIFIED_TAGS=$((VERIFIED_TAGS + 1))
+              if ! VMANIFEST=$(registry_get "$vdigest"); then
+                printf '%s\t%s\t%s\n' "$vtags" "$vdigest" "index unreadable" >> "$WORK_DIR/broken_tags"
+                continue
+              fi
+              while IFS= read -r vchild; do
+                [ -z "$vchild" ] && continue
+                if ! registry_exists "$vchild"; then
+                  printf '%s\t%s\t%s\n' "$vtags" "$vdigest" "missing child $vchild" >> "$WORK_DIR/broken_tags"
+                fi
+              done < <(printf '%s' "$VMANIFEST" | jq -r '.manifests[]?.digest // empty')
+            done < <(printf '%s' "$RESULTS" | jq -r '.to_keep[] | select(.tags | length > 0) | "\(.name)\t\(.tags | join(","))"')
+
+            # Damage this run caused is a hard failure. Damage that was
+            # already there (recorded above, before anything was deleted) is
+            # reported but must not fail every future run, since only a
+            # rebuild can restore those manifests.
+            : >| "$WORK_DIR/broken_new"
+            : >| "$WORK_DIR/broken_old"
+            while IFS= read -r row; do
+              [ -z "$row" ] && continue
+              rowdigest=${row##*missing child }
+              if [ "$rowdigest" != "$row" ] && grep -qxF -- "$rowdigest" "$UNRESOLVED_FILE"; then
+                printf '%s\n' "$row" >> "$WORK_DIR/broken_old"
+              else
+                printf '%s\n' "$row" >> "$WORK_DIR/broken_new"
+              fi
+            done < "$WORK_DIR/broken_tags"
+
+            BROKEN_NEW_COUNT=$(grep -c . "$WORK_DIR/broken_new" || true)
+            BROKEN_OLD_COUNT=$(grep -c . "$WORK_DIR/broken_old" || true)
+            echo "Checked $VERIFIED_TAGS surviving tagged image(s): $BROKEN_NEW_COUNT new problem(s), $BROKEN_OLD_COUNT pre-existing"
+
+            if [ "$BROKEN_OLD_COUNT" -gt 0 ]; then
+              {
+                echo "### ⚠️ Tags broken before this run ($BROKEN_OLD_COUNT)"
+                echo ""
+                echo "These tags already referenced missing manifests when the run started."
+                echo "Only a rebuild and re-push restores them."
+                echo ""
+                echo "| Tags | Version | Problem |"
+                echo "|------|---------|---------|"
+                awk -F'\t' '{printf "| %s | %s | %s |\n", $1, $2, $3}' "$WORK_DIR/broken_old"
+                echo ""
+              } >> "$SUMMARY_FILE"
+            fi
+
+            if [ "$BROKEN_NEW_COUNT" -gt 0 ]; then
+              echo ""
+              echo "Error: this run left $BROKEN_NEW_COUNT surviving tag reference(s) unpullable:"
+              sed 's/^/  /' "$WORK_DIR/broken_new"
+              {
+                echo "### ❌ This run broke surviving tags ($BROKEN_NEW_COUNT)"
+                echo ""
+                echo "After cleanup these kept tags reference manifests that are no longer in"
+                echo "the registry. They still resolve, but every pull of them fails."
+                echo ""
+                echo "| Tags | Version | Problem |"
+                echo "|------|---------|---------|"
+                awk -F'\t' '{printf "| %s | %s | %s |\n", $1, $2, $3}' "$WORK_DIR/broken_new"
+                echo ""
+              } >> "$SUMMARY_FILE"
+              cat "$SUMMARY_FILE" >> "$GITHUB_STEP_SUMMARY"
+              exit 1
+            fi
+            echo ""
+
             echo "=== Summary ==="
             echo "Protected: $PROTECTED_COUNT"
             echo "Kept: $KEPT_COUNT"
